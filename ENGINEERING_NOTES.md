@@ -1,0 +1,1 @@
+This will be used to log everything I found difficult, debugged through, and lessons learned. A different approach from my previous projects
