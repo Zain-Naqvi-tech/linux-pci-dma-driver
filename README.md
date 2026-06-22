@@ -13,10 +13,10 @@ present. `probe()` enables the device (`pci_enable_device`, error-checked);
 `remove()` disables it on unload.
 
 ### Build & load (inside the guest)
-\`\`\`
+```bash
 cd /mnt/host
 make
 sudo insmod edu.ko      # kernel calls probe() → "Successfully enabled PCI device"
 sudo dmesg | tail
 sudo rmmod edu          # runs remove()
-\`\`\`
+```
