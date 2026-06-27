@@ -20,3 +20,5 @@ sudo insmod edu.ko      # kernel calls probe() → "Successfully enabled PCI dev
 sudo dmesg | tail
 sudo rmmod edu          # runs remove()
 ```
+
+`probe()` enables the device, claims BAR 0, maps it into kernel space with `ioremap()`, and reads the EDU identification register at offset 0x00 over MMIO. The expected value for this is `0x010000ed`. The teardown in case of errors includes the use of a `goto` keyword so any failure unwinds smoothly and as intended, in reverse. `remove()` unmaps and releases in LIFO order. 

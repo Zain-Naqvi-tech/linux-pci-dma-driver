@@ -13,6 +13,8 @@ MODULE_AUTHOR("Zain");
 MODULE_DESCRIPTION("PCI Driver Work");
 MODULE_VERSION("1.0");
 
+static void __iomem *io_base; //This annotation allows us to store the void generic pointer type returned by ioremap, and helps in stopping compiler optimizations
+
 static const struct pci_device_id pci_ids[] = { //an array of the struct pci_device_id listing what we match with 
     { PCI_DEVICE(EDU_VENDOR_ID, EDU_DEVICE_ID) }, //Give the device our specifics
     {} //need to add this empty element to tell the system that the list is now complete
@@ -21,20 +23,54 @@ MODULE_DEVICE_TABLE(pci, pci_ids); //helps the kernel match hardware devices to 
 
 //breif function is called when a PCI device is registered. It takes in dev and id information
 static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
-    int result = pci_enable_device(dev); //takes in the pointer to the PCI device. Wakes up the device and PCI bridge, along with allocation of resources like I/O ports and memory regions
+
+    u32 registerValue; //32 bit unsigned integer to store the value read from the BAR0 region
+    int result;
+
+    //ENABLE
+    result = pci_enable_device(dev); //takes in the pointer to the PCI device. Wakes up the device and PCI bridge, along with allocation of resources like I/O ports and memory regions
     if (result) { //error is non-zero
         dev_err(&dev->dev, "Failed to enable PCI device\n");
-        return result;
+        return result; //straight return, no goto ladder used
     }
-    
+
+    //  CLAIM BAR0 REGION
+    result = pci_request_region(dev, 0, "edu");
+    if (result) { //request the first BAR region of the device. This is the memory region that the device uses to communicate with the CPU. The second argument is the BAR number, and the third argument is a name for the region
+        dev_err(&dev->dev, "Failed to request PCI region\n");
+        //we need to use goto here to GO TO the area which disables it
+        goto err_disable_device; //goto is used to jump to a label. In this case, we are jumping to the label that disables the device and returns an error code
+    } 
+
+    //MAP BAR0 REGION
+    io_base = ioremap(pci_resource_start(dev, 0), pci_resource_len(dev, 0)); //resource_start is the version register address which is 0x00. We are expecting a return of 0x010000ed
+    if (!io_base) {
+        dev_err(&dev->dev, "Failed to Map\n");
+        result = -ENOMEM; //macro that returns an error code for 'out of memory'
+        goto err_release_region;        
+    }
+
+    //io_base is a pointer type. We can not dereference it, so we end up using ioread32
+    registerValue = ioread32(io_base); //Used to read 32 bit values without the need for dereferencing a pointer. This protects us from caching and compiler optimizations
+
     pr_info("Successfully enabled PCI device\n");
+    pr_info("Read value from BAR0: 0x%08x\n", registerValue); //writes the kernel log buffer which we read with dmesg
     
     
     return 0;
+
+err_release_region:
+    pci_release_region(dev, 0); //to avoid leaks
+err_disable_device:
+    pci_disable_device(dev); //disables the device and releases resources
+    return result;
 }
 
 //brief function is called when a PCI device is unregistered. It takes in dev information
 static void remove(struct pci_dev* dev){
+    //We unmap, then release the claimed memory in said order
+    iounmap(io_base); //unmap the BAR0 region from virtual Kernel Space
+    pci_release_region(dev, 0); //release the claimed BAR0 region
     pci_disable_device(dev);
     pr_info("Removed Device Successfully\n");
 }
