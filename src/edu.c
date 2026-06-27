@@ -43,7 +43,7 @@ static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
     } 
 
     //MAP BAR0 REGION
-    io_base = ioremap(pci_resource_start(dev, 0), pci_resource_len(dev, 0)); //resource_start is the version register address which is 0x00. We are expecting a return of 0x010000ed
+    io_base = ioremap(pci_resource_start(dev, 0), pci_resource_len(dev, 0)); //Base of BAR0 is the first argument, and the length of BAR0 is the second argument. This maps the physical address of BAR0 to a virtual address in kernel space. The return value is a pointer to the virtual address, which we store in io_base
     if (!io_base) {
         dev_err(&dev->dev, "Failed to Map\n");
         result = -ENOMEM; //macro that returns an error code for 'out of memory'
