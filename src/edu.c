@@ -21,6 +21,10 @@ static const struct pci_device_id pci_ids[] = { //an array of the struct pci_dev
 };
 MODULE_DEVICE_TABLE(pci, pci_ids); //helps the kernel match hardware devices to the appropriate driver
 
+static const struct edu_device {
+    
+}
+
 //breif function is called when a PCI device is registered. It takes in dev and id information
 static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
 
