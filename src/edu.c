@@ -4,6 +4,10 @@
 #define EDU_VENDOR_ID 0x1234
 #define EDU_DEVICE_ID 0x11e8
 
+#define STATUS_REGISTER 0x20
+#define FACTORIAL_COMPUTATION_REGISTER 0x08
+#define STATUS_REGISTER_BIT_0_MASK 0x01
+
 #include <linux/module.h> //all kernel modules
 #include <linux/pci.h> //used to interact with PCI drivers and devices
 #include <linux/init.h> //__init and __exit macros 
@@ -16,13 +20,10 @@ MODULE_DESCRIPTION("PCI Driver Work");
 MODULE_VERSION("1.0");
 
 //read function: polls the EDU's status register to see if the first bit clears. Then, it reads the result in factorial computation register (0x08) 
-static ssize_t read_driver(struct file *flip, char __user *user_buf, size_t len, loff_t *offset) {
+static ssize_t read_driver(struct file *filp, char __user *user_buf, size_t len, loff_t *offset);
 
-}
 //write function: write into the status register (0x20) to set its first bit. Write the input number to the factorial computation register (0x08). 
-static ssize_t write_driver(struct file *flip, const char __user *user_buf, size_t len, loff_t *offset) {
-    
-}
+static ssize_t write_driver(struct file *filp, const char __user *user_buf, size_t len, loff_t *offset);
 
 static const struct pci_device_id pci_ids[] = { //an array of the struct pci_device_id listing what we match with 
     { PCI_DEVICE(EDU_VENDOR_ID, EDU_DEVICE_ID) }, //Give the device our specifics
@@ -41,6 +42,37 @@ static struct file_operations fops = {
     .read = read_driver,
     .write = write_driver
 };
+
+static ssize_t read_driver(struct file *filp, char __user *user_buf, size_t len, loff_t *offset) {
+    struct miscdevice *mdev = filp->private_data; //filp->private_data is a pointer to the miscdev field inside the edudev
+    struct edu_device *edudev = container_of(mdev, struct edu_device, miscdev); //this is a macro that takes in a pointer to a struct, the type of the struct, and the name of the field inside the struct. It returns a pointer to the struct that contains the field. In this case, we are getting a pointer to the edu_device struct that contains the miscdev field
+
+    //poll the status register until the device clears it
+    while (ioread32(edudev->io_base + (STATUS_REGISTER & STATUS_REGISTER_BIT_0_MASK))) {cpu_relax();} //loops as long as first bit is 1. 
+    u32 result = ioread32(edudev->io_base + FACTORIAL_COMPUTATION_REGISTER); //reads the result from the factorial computation register (0x08). ioread32 is used to read 32 bit values without the need for dereferencing a pointer. This protects us from caching and compiler optimizations
+
+    if (copy_to_user(user_buf, &result, sizeof(result))) {
+        return -EFAULT; //bytes failed to copy
+    }
+
+    return len;
+
+}   
+
+static ssize_t write_driver(struct file *filp, const char __user *user_buf, size_t len, loff_t *offset) {
+    struct miscdevice *mdev = filp->private_data; //filp->private_data is a pointer to the miscdev field inside the edudev
+    struct edu_device *edudev = container_of(mdev, struct edu_device, miscdev);
+
+    u32 input_number;
+    if (copy_from_user(&input_number, user_buf, sizeof(input_number))) { //copies the input from user_buf into the input_number local to this function
+        return -EFAULT; //bytes failed to copy
+    } 
+
+    iowrite32(input_number, edudev->io_base + FACTORIAL_COMPUTATION_REGISTER); //writes the input number to factorial computation register (0x08). 
+
+
+    return len;
+}
 
 //breif function is called when a PCI device is registered. It takes in dev and id information
 static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
@@ -83,7 +115,7 @@ static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
 
     edudev->miscdev = (struct miscdevice){
         .minor = MISC_DYNAMIC_MINOR,
-        .name = "misc_device",
+        .name = "edu",
         .fops = &fops,
     };
 
@@ -102,7 +134,6 @@ static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
     return 0;
 
 err_misc_register:
-    misc_deregister(&edudev->miscdev);
     iounmap(edudev->io_base); //unmap the BAR0 region from virtual Kernel Space
 err_release_region:
     pci_release_region(dev, 0); //to avoid leaks
