@@ -22,3 +22,30 @@ sudo rmmod edu          # runs remove()
 ```
 
 `probe()` enables the device, claims BAR 0, maps it into kernel space with `ioremap()`, and reads the EDU identification register at offset 0x00 over MMIO. The expected value for this is `0x010000ed`. The teardown in case of errors includes the use of a `goto` keyword so any failure unwinds smoothly and as intended, in reverse. `remove()` unmaps and releases in LIFO order. 
+
+## Phase 2: Character device and file operations
+
+The driver exposes the EDU device to userspace as a character device at
+`/dev/edu`, registered with `misc_register` (dynamic minor under the shared
+misc major). Per-device state lives in a `struct edu_device` allocated in
+`probe()` with `devm_kzalloc`, which embeds the `miscdevice` so that read and
+write can recover the device from `filp->private_data`.
+
+`write()` takes a 4-byte unsigned integer and stores it in the factorial
+computation register (0x08), which triggers the device. `read()` polls bit 0
+of the status register (0x20) until the device signals completion, then returns
+the result from 0x08. The interface validates the transfer length, checks the
+result of every userspace copy, guards against reading before a write, and
+rejects inputs above 12 (13! exceeds a 32-bit result).
+
+### Usage (inside the guest, module loaded)
+```bash
+# Write the integer 5 as raw little-endian bytes
+printf '\x05\x00\x00\x00' | sudo tee /dev/edu > /dev/null
+
+# Read the 4-byte result back as an unsigned integer
+sudo od -An -tu4 /dev/edu      # -> 120
+```
+
+The device node is created by `misc_register` in `probe()` and removed by
+`misc_deregister` in `remove()`, so it exists only while the module is loaded.

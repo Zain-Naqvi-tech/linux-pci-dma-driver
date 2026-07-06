@@ -22,7 +22,7 @@ MODULE_VERSION("1.0");
 //read function: polls the EDU's status register to see if the first bit clears. Then, it reads the result in factorial computation register (0x08) 
 static ssize_t read_driver(struct file *filp, char __user *user_buf, size_t len, loff_t *offset);
 
-//write function: write into the status register (0x20) to set its first bit. Write the input number to the factorial computation register (0x08). 
+//write function: Write the input number to the factorial computation register (0x08). 
 static ssize_t write_driver(struct file *filp, const char __user *user_buf, size_t len, loff_t *offset);
 
 static const struct pci_device_id pci_ids[] = { //an array of the struct pci_device_id listing what we match with 
@@ -35,6 +35,7 @@ struct edu_device {
     struct miscdevice miscdev; //struct for the misc device (from the miscdevice.h file) 
     //the __iomem means that the pointer is to a memory-mapped I/O region. This is used to tell the compiler that the pointer is not a normal pointer, and that it should not optimize accesses to it
     void __iomem *io_base; //pointer to the base of the BAR0 region. This is used to read and write to the device
+    u32 readFlag; //shared flag to indicate if something has been written to the register. This is used to prevent reading from the register before something has been written to it
 };
 
 static struct file_operations fops = {
@@ -47,15 +48,26 @@ static ssize_t read_driver(struct file *filp, char __user *user_buf, size_t len,
     struct miscdevice *mdev = filp->private_data; //filp->private_data is a pointer to the miscdev field inside the edudev
     struct edu_device *edudev = container_of(mdev, struct edu_device, miscdev); //this is a macro that takes in a pointer to a struct, the type of the struct, and the name of the field inside the struct. It returns a pointer to the struct that contains the field. In this case, we are getting a pointer to the edu_device struct that contains the miscdev field
 
+    //we can only read from the register if something has been written to it
+    if (!(edudev->readFlag)) { //if the shared flag is not zero, that means that something has not been written to the register, and we will end up reading garbage data
+        return -EAGAIN; //return an error code that indicates that the operation should be tried again later
+    }
+
     //poll the status register until the device clears it
-    while (ioread32(edudev->io_base + (STATUS_REGISTER & STATUS_REGISTER_BIT_0_MASK))) {cpu_relax();} //loops as long as first bit is 1. 
+    u32 statusRegister = ioread32(edudev->io_base + STATUS_REGISTER); //reads the status register (0x20) to check if the first bit is cleared. 
+    while (statusRegister & STATUS_REGISTER_BIT_0_MASK) { //while the first bit is 1, keep polling
+        statusRegister = ioread32(edudev->io_base + STATUS_REGISTER); //read the status register again
+        cpu_relax(); //this is a macro that tells the CPU to relax. This is used to prevent the CPU from spinning too fast and wasting power. It also allows other threads to run on the CPU
+    }
+
     u32 result = ioread32(edudev->io_base + FACTORIAL_COMPUTATION_REGISTER); //reads the result from the factorial computation register (0x08). ioread32 is used to read 32 bit values without the need for dereferencing a pointer. This protects us from caching and compiler optimizations
 
     if (copy_to_user(user_buf, &result, sizeof(result))) {
         return -EFAULT; //bytes failed to copy
     }
 
-    return len;
+    edudev->readFlag = 0; //reset the shared flag to indicate that the register has been read and is now empty
+    return sizeof(result); //we need to return the number of bytes read, which is the sizeof(result)
 
 }   
 
@@ -64,14 +76,21 @@ static ssize_t write_driver(struct file *filp, const char __user *user_buf, size
     struct edu_device *edudev = container_of(mdev, struct edu_device, miscdev);
 
     u32 input_number;
+    if (len != sizeof(input_number)) { //check if the length of the input is equal to the size of the input_number variable
+        return -EINVAL; //invalid argument
+    }
     if (copy_from_user(&input_number, user_buf, sizeof(input_number))) { //copies the input from user_buf into the input_number local to this function
         return -EFAULT; //bytes failed to copy
     } 
 
+    if (input_number > 12) {
+        return -EOVERFLOW; //overflow error code. This is because the factorial of numbers greater than 12 will overflow a 32-bit unsigned integer
+    }
+
     iowrite32(input_number, edudev->io_base + FACTORIAL_COMPUTATION_REGISTER); //writes the input number to factorial computation register (0x08). 
+    edudev->readFlag = 1; //set the shared flag to indicate that something has been written to the register
 
-
-    return len;
+    return sizeof(input_number); //we need to return the number of bytes written, which is the sizeof(input_number)
 }
 
 //breif function is called when a PCI device is registered. It takes in dev and id information
@@ -79,7 +98,6 @@ static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
 
     u32 registerValue; //32 bit unsigned integer to store the value read from the BAR0 region
     int result;
-    int misc_result;
 
     //using device manager kzalloc to allocate memory for the edu_device struct. 
     struct edu_device *edudev = devm_kzalloc(&dev->dev, sizeof(*edudev), GFP_KERNEL);
@@ -119,8 +137,8 @@ static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
         .fops = &fops,
     };
 
-    misc_result = misc_register(&edudev->miscdev); //register the misc device with the kernel. This creates a device file in /dev/misc device, which we can use to communicate with the driver
-    if (misc_result) {
+    result = misc_register(&edudev->miscdev); //register the misc device with the kernel. This creates a device file in /dev/misc device, which we can use to communicate with the driver
+    if (result) {
         goto err_misc_register; //goto is used to jump to the err_misc_register label, which unmaps the region, and continues with the fail-safe driver exit
     }
 
