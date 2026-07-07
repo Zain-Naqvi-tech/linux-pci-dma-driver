@@ -6,6 +6,10 @@
 > formatting only. Nothing has been changed in substance. Every observation, mistake, and
 > lesson here is genuinely mine and reflects my learning process :)
 
+To start up the device: Saving it here so I don't have to constantly refer to the long Notes document on Onenote:
+- `./run.sh` to start up the device
+- `sudo mount -t 9p -o trans=virtio,version=9p2000.L hostshare /mnt/host` for the pipeline between the guest and host
+
 This will be used to log everything I found difficult, debugged through, and lessons learned. A different approach from my previous projects.
 
 ## New C Keyword: goto
