@@ -23,7 +23,7 @@ int main() {
     }
 
     //WRITE: successfully opened the file. Now, we write to it
-    successWrite = write(ourFile, &inputNum, sizeof(inputNum)); //Writes the inputNum to the file. Returns the number of bytes written successfully 
+    //successWrite = write(ourFile, &inputNum, sizeof(inputNum)); //Writes the inputNum to the file. Returns the number of bytes written successfully 
     if (successWrite == -1) { //failed to write to the file
 
         printf("Driver write failed with error code: %s\n", strerror(errno));

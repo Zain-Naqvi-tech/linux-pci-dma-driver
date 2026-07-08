@@ -8,5 +8,5 @@ qemu-system-x86_64 \
   -device edu \
   -netdev user,id=net0,hostfwd=tcp::2222-:22 \
   -device virtio-net-pci,netdev=net0 \
-  -virtfs local,path=$HOME/edu-driver/src,mount_tag=hostshare,security_model=none \
+  -virtfs local,path=$HOME/edu-driver,mount_tag=hostshare,security_model=none \
   -nographic

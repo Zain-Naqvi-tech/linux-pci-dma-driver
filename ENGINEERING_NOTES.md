@@ -212,6 +212,70 @@ od: /dev/edu: Resource temporarily unavailable
         120
 120 means we are good. The od print means our error handling and flag stuff worked. We used `-EAGAIN` which prints out 'temporarily unavailable' so this means that on the read where the flag is cleared and nothing has been written to it, so this error comes out. 
 
+# Userspace Test Application (edu_test.c)
+
+Small userspace C application which opens `/dev/edu` and exercises the operations. This is not the real or final library we have planned out for Phase 3. This is just to show that the two statements we use to write and read from the device can be turned into a userspace library, and it lays the foundation for the final one.
+
+This small userspace C application opens the file, writes an integer to it, and reads back the returned factorial of that integer. Basically, it is a way to do what we do in the terminal, but in a more automated way.
+
+## Design
+
+- Main purpose: rewire the read and write stuff into this userspace application.
+- What is a userspace library: a collection of pre-compiled code that runs in userspace.
+- So basically an abstraction, a system-level wrapper.
+- The flowchart can be seen in the rough notes section (it looks a bit low quality, so refer to the rough notes).
+
+### Expected behavior
+
+| Input | Output |
+| :--- | :--- |
+| 5 | 120 |
+| 13 | -EOVERFLOW |
+| Read before write | -EAGAIN |
+| Wrong length | -EINVAL |
+
+## Coding
+
+- First thing, we need a new file: a `.c` file built with gcc.
+- Named it `edu_test.c` in a new `/userspace` folder.
+- Clarification: this is a wrapper application, by definition not a library.
+
+### Libraries needed for read/write
+
+- `fcntl.h`: for `open()`.
+- `unistd.h`: for `write()`, `read()`, and `close()`.
+- We don't need anything special for the errors. We just need the basics like `stdint.h` for int types.
+- We also need `errno.h` and `stdio.h` for the errno macro and error handling.
+
+### Notes learned while coding
+
+- `open(const char *__file, int __oflag, ...) __nonnull((1))` returns an int, and returns -1 on failure (confirmed).
+- The three dots in a function declaration mean we can pass a third or more parameters if needed. For our case we only need two: the file path (`/dev/edu`) and `O_RDWR`. This int flag allows us to both write to and read the result from the file. Something new I picked up.
+- Revision: I made a mistake where I overlooked the rule that variables with static storage (global) must be initialized with constant literals, not function calls.
+    - So for the `open()` return value to be stored directly in a variable at that scope, the variable must be declared globally. Only then can we store a function's return directly into it.
+- When the write and read functions return -1, they also set a variable called `errno`, which comes from the driver side. So we need to output that as well.
+- Done writing the code. Had some type mismatches when saving the read/write return values. The rest seems good.
+
+## Build
+
+Something new, so I researched how to compile and link this to the driver, and the difference between gcc and make.
+
+- The driver is kernel code. The app is userspace code. They do not share headers and they do not link.
+- This is the ordinary case, so one `.c` produces a normal executable.
+
+### Issue: userspace folder not visible in guest
+
+- The `userspace` folder was not showing under the QEMU guest when I ran `ls`. This meant it could not run on the device.
+- Fix: I changed the guest's shared path to include the whole `edu-driver` folder, not just `src`.
+
+## Verification
+
+- Input 5: output was "The output from the driver is 120". Good.
+- Input 13 (should return overflow): returned overflow. Good.
+- Commented out the write line so a read happens without a write (should return `-EAGAIN`): output was "Resource temporarily unavailable". Good.
+
+All cases pass.
+
 ---
 
 # Syntax Notes
