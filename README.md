@@ -49,3 +49,36 @@ sudo od -An -tu4 /dev/edu      # -> 120
 
 The device node is created by `misc_register` in `probe()` and removed by
 `misc_deregister` in `remove()`, so it exists only while the module is loaded.
+
+## Userspace Test App (edu_test.c)
+
+A small userspace C app that opens `/dev/edu`, writes an integer to it, and reads back
+the factorial the device computed. Basically the terminal `printf`/`od` handshake from
+Phase 2, but automated in one program.
+
+This is not the real library (that comes later). It just proves the write and read
+path can be wrapped in userspace code, and lays the groundwork for the actual library later.
+
+### What it uses
+- `fcntl.h` for `open()`
+- `unistd.h` for `write()`, `read()`, `close()`
+- `errno.h` and `stdio.h` for error reporting
+- `stdint.h` for fixed-width int types
+
+Opens the device with `O_RDWR` so the same file descriptor can both write and read.
+On any failure the syscall returns -1 and sets `errno`, which the app prints so you can
+see exactly what the driver rejected.
+
+### Build and run
+
+```bash
+cd /mnt/host/src && make && sudo insmod edu.ko
+cd /mnt/host/userspace && gcc -Wall -Wextra -o edu_test edu_test.c
+sudo ./edu_test
+```
+
+### What it checks
+- Input 5 returns 120
+- Input 13 returns -EOVERFLOW (13! overflows u32)
+- Read before write returns -EAGAIN
+- Wrong length returns -EINVAL
