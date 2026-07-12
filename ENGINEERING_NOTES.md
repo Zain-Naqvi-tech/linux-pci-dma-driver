@@ -6,6 +6,8 @@
 > formatting only. Nothing has been changed in substance. Every observation, mistake, and
 > lesson here is genuinely mine and reflects my learning process :)
 
+Main source: https://docs.kernel.org/PCI/pci.html#c.pci_device_id
+
 To start up the device: Saving it here so I don't have to constantly refer to the long Notes document on Onenote:
 - `./run.sh` to start up the device
 - `sudo mount -t 9p -o trans=virtio,version=9p2000.L hostshare /mnt/host` for the pipeline between the guest and host
