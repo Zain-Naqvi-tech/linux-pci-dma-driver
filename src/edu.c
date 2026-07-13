@@ -98,6 +98,7 @@ static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
 
     u32 registerValue; //32 bit unsigned integer to store the value read from the BAR0 region
     int result;
+    int vector;
 
     //using device manager kzalloc to allocate memory for the edu_device struct. 
     struct edu_device *edudev = devm_kzalloc(&dev->dev, sizeof(*edudev), GFP_KERNEL);
@@ -131,6 +132,18 @@ static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
         goto err_release_region;        
     }
 
+    //allocate MSI vectors
+    result = pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI); //request 1 MSI vector. The first argument is the pointer to the PCI device, the second argument is the minimum number of vectors we want, the third argument is the maximum number of vectors we want, and the fourth argument is the type of interrupt we want (MSI in this case)
+    if (result < 0) { //returns the number of vectors allocated or an error code (negative)
+        dev_err(&dev->dev, "Failed to allocate MSI vector\n");
+        goto err_alloc_irqvectors;
+    }
+
+    vector = pci_irq_vector(dev, 0); //get the vector number of the first MSI vector hence the nr as 0. This needs to be passed into the request_irq function
+
+    //request irq
+    result = request_irq(vector,1,1,"edu",&dev);
+
     edudev->miscdev = (struct miscdevice){
         .minor = MISC_DYNAMIC_MINOR,
         .name = "edu",
@@ -139,7 +152,7 @@ static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
 
     result = misc_register(&edudev->miscdev); //register the misc device with the kernel. This creates a device file in /dev/misc device, which we can use to communicate with the driver
     if (result) {
-        goto err_misc_register; //goto is used to jump to the err_misc_register label, which unmaps the region, and continues with the fail-safe driver exit
+        goto err_misc_register; //goto is used to jump to the err_misc_register label, which now frees the allocated vectors, unmaps the region, and continues with the fail-safe driver exit
     }
 
     //io_base is a pointer type. We can not dereference it, so we end up using ioread32
@@ -152,6 +165,8 @@ static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
     return 0;
 
 err_misc_register:
+    pci_free_irq_vectors(dev); //free the allocations
+err_alloc_irqvectors:
     iounmap(edudev->io_base); //unmap the BAR0 region from virtual Kernel Space
 err_release_region:
     pci_release_region(dev, 0); //to avoid leaks
