@@ -56,8 +56,6 @@ static struct file_operations fops = {
 static irqreturn_t irq_handler(int irq, void *dev_id) {
     struct edu_device *edudev = dev_id; //get an edu_device instance using the dev_id being passed in
 
-    pr_info("ISR entered, irq=%d\n", irq); //debugging message
-
     u32 result = ioread32(edudev->io_base + INTERRUPT_STATUS_REGISTER); //read the interrupt status register to determine the cause of the interrupt
     if (result == 0) { //if the interrupt status register is 0, that means that the interrupt was not caused by our device
         return IRQ_NONE; //return IRQ_NONE to indicate that the interrupt was not handled
@@ -118,12 +116,10 @@ static ssize_t write_driver(struct file *filp, const char __user *user_buf, size
     
     //arm the interrupt
     iowrite32(STATUS_REGISTER_BIT_7_MASK, edudev->io_base + STATUS_REGISTER); //write to the status register to arm the interrupt. This is done by setting the 7th bit of the status register to 1
-    pr_info("status after arm: 0x%08x\n", ioread32(edudev->io_base + STATUS_REGISTER));
 
     iowrite32(input_number, edudev->io_base + FACTORIAL_COMPUTATION_REGISTER); //writes the input number to factorial computation register (0x08). 
     edudev->readFlag = 1; //set the shared flag to indicate that something has been written to the register
 
-    pr_info("status after trigger: 0x%08x\n", ioread32(edudev->io_base + STATUS_REGISTER));
     return sizeof(input_number); //we need to return the number of bytes written, which is the sizeof(input_number)
 }
 
@@ -151,6 +147,8 @@ static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
         return result; //straight return, no goto ladder used
     }
 
+    pci_set_master(dev); //enable bus mastering for the device
+
     //  CLAIM BAR0 REGION
     result = pci_request_region(dev, 0, "edu");
     if (result) { //request the first BAR region of the device. This is the memory region that the device uses to communicate with the CPU. The second argument is the BAR number, and the third argument is a name for the region
@@ -175,17 +173,12 @@ static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
     }
 
     edudev->vector = pci_irq_vector(dev, 0); //get the vector number of the first MSI vector hence the nr as 0. This needs to be passed into the request_irq function
-    pr_info("alloc_irq_vectors returned %d, vector=%d\n", result, edudev->vector);
     //request irq
     result = request_irq(edudev->vector,irq_handler,0,"edu",edudev);
     if (result) {
         dev_err(&dev->dev, "Failed to request IRQ\n");
         goto err_irq_request;
     }
-
-    pr_info("BEFORE MANUAL RAISE");
-    iowrite32(0x1, edudev->io_base + 0x60);   // manual raise — pure delivery test
-    pr_info("AFTER MANUAL RAISE");
 
     edudev->miscdev = (struct miscdevice){
         .minor = MISC_DYNAMIC_MINOR,
