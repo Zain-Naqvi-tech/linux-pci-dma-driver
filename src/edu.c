@@ -7,6 +7,9 @@
 #define STATUS_REGISTER 0x20
 #define FACTORIAL_COMPUTATION_REGISTER 0x08
 #define STATUS_REGISTER_BIT_0_MASK 0x01
+#define STATUS_REGISTER_BIT_7_MASK 0x80
+#define INTERRUPT_STATUS_REGISTER 0x24 //contains the value which raised the interrupt (used at the start of an ISR)
+#define INTERRUPT_ACK_REGISTER 0X64 //clears an interrupt (used at the end of an ISR)
 
 #include <linux/module.h> //all kernel modules
 #include <linux/pci.h> //used to interact with PCI drivers and devices
@@ -18,6 +21,9 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Zain");
 MODULE_DESCRIPTION("PCI Driver Work");
 MODULE_VERSION("1.0");
+
+//irq_handler function: This is the ISR that is called when the device generates an interrupt
+static irqreturn_t irq_handler(int irq, void *dev_id);
 
 //read function: polls the EDU's status register to see if the first bit clears. Then, it reads the result in factorial computation register (0x08) 
 static ssize_t read_driver(struct file *filp, char __user *user_buf, size_t len, loff_t *offset);
@@ -36,6 +42,8 @@ struct edu_device {
     //the __iomem means that the pointer is to a memory-mapped I/O region. This is used to tell the compiler that the pointer is not a normal pointer, and that it should not optimize accesses to it
     void __iomem *io_base; //pointer to the base of the BAR0 region. This is used to read and write to the device
     u32 readFlag; //shared flag to indicate if something has been written to the register. This is used to prevent reading from the register before something has been written to it
+    u32 vector;
+    struct completion work_done; //completion struct to put the thread to sleep until the ISR wakes it up
 };
 
 static struct file_operations fops = {
@@ -44,23 +52,40 @@ static struct file_operations fops = {
     .write = write_driver
 };
 
+//The ISR
+static irqreturn_t irq_handler(int irq, void *dev_id) {
+    struct edu_device *edudev = dev_id; //get an edu_device instance using the dev_id being passed in
+
+    u32 result = ioread32(edudev->io_base + INTERRUPT_STATUS_REGISTER); //read the interrupt status register to determine the cause of the interrupt
+    if (result == 0) { //if the interrupt status register is 0, that means that the interrupt was not caused by our device
+        return IRQ_NONE; //return IRQ_NONE to indicate that the interrupt was not handled
+    }
+    iowrite32(result, edudev->io_base + INTERRUPT_ACK_REGISTER); //write result to the interrupt acknowledge register to clear the interrupt
+
+    complete(&work_done); //wakes up the thread
+    return IRQ_HANDLED; 
+}
+
 static ssize_t read_driver(struct file *filp, char __user *user_buf, size_t len, loff_t *offset) {
     struct miscdevice *mdev = filp->private_data; //filp->private_data is a pointer to the miscdev field inside the edudev
     struct edu_device *edudev = container_of(mdev, struct edu_device, miscdev); //this is a macro that takes in a pointer to a struct, the type of the struct, and the name of the field inside the struct. It returns a pointer to the struct that contains the field. In this case, we are getting a pointer to the edu_device struct that contains the miscdev field
+    u32 result;
+    int completion_result;
 
     //we can only read from the register if something has been written to it
     if (!(edudev->readFlag)) { //if the shared flag is not zero, that means that something has not been written to the register, and we will end up reading garbage data
         return -EAGAIN; //return an error code that indicates that the operation should be tried again later
     }
 
-    //poll the status register until the device clears it
-    u32 statusRegister = ioread32(edudev->io_base + STATUS_REGISTER); //reads the status register (0x20) to check if the first bit is cleared. 
-    while (statusRegister & STATUS_REGISTER_BIT_0_MASK) { //while the first bit is 1, keep polling
-        statusRegister = ioread32(edudev->io_base + STATUS_REGISTER); //read the status register again
-        cpu_relax(); //this is a macro that tells the CPU to relax. This is used to prevent the CPU from spinning too fast and wasting power. It also allows other threads to run on the CPU
+    //so we need to remove the polling part and replace it with the interrupt stuff. For now, we need to figure out WHERE the function goes to sleep and it is right here
+    //after it wakes up, it then reads and copies to user - so let's just put the wait_for_completion here and see if it works. 
+
+    completion_result = wait_for_completion_interruptible(&work_done); //this is a macro that puts the thread to sleep until the ISR wakes it up
+    if (completion_result) { //if the thread was interrupted by a signal, we need to return an error code
+        return -ERESTARTSYS; //return an error code that indicates that the operation should be restarted
     }
 
-    u32 result = ioread32(edudev->io_base + FACTORIAL_COMPUTATION_REGISTER); //reads the result from the factorial computation register (0x08). ioread32 is used to read 32 bit values without the need for dereferencing a pointer. This protects us from caching and compiler optimizations
+    result = ioread32(edudev->io_base + FACTORIAL_COMPUTATION_REGISTER); //reads the result from the factorial computation register (0x08). ioread32 is used to read 32 bit values without the need for dereferencing a pointer. This protects us from caching and compiler optimizations
 
     if (copy_to_user(user_buf, &result, sizeof(result))) {
         return -EFAULT; //bytes failed to copy
@@ -87,6 +112,11 @@ static ssize_t write_driver(struct file *filp, const char __user *user_buf, size
         return -EOVERFLOW; //overflow error code. This is because the factorial of numbers greater than 12 will overflow a 32-bit unsigned integer
     }
 
+    reinit_completion(&work_done); //reinitialize the completion struct to reset the 'done' field to 0 and the waiting queue to empty. This is used to prevent the thread from waking up before the ISR has been called
+    
+    //arm the interrupt
+    iowrite32(STATUS_REGISTER_BIT_7_MASK, edudev->io_base + STATUS_REGISTER); //write to the status register to arm the interrupt. This is done by setting the 7th bit of the status register to 1
+
     iowrite32(input_number, edudev->io_base + FACTORIAL_COMPUTATION_REGISTER); //writes the input number to factorial computation register (0x08). 
     edudev->readFlag = 1; //set the shared flag to indicate that something has been written to the register
 
@@ -105,6 +135,8 @@ static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
     if (!edudev) {
         return -ENOMEM;
     }
+
+    init_completion(&edudev->work_done); //initialize the completion struct to set the 'done' field to 0 and the waiting queue to empty. This is used to put the thread to sleep until the ISR wakes it up
 
     //STORE
     dev_set_drvdata(&dev->dev, edudev); //store the pointer to the edu_device struct in the dev->dev->driver_data field. This is used to retrieve the struct in remove()
@@ -139,10 +171,14 @@ static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
         goto err_alloc_irqvectors;
     }
 
-    vector = pci_irq_vector(dev, 0); //get the vector number of the first MSI vector hence the nr as 0. This needs to be passed into the request_irq function
+    edudev->vector = pci_irq_vector(dev, 0); //get the vector number of the first MSI vector hence the nr as 0. This needs to be passed into the request_irq function
 
     //request irq
-    result = request_irq(vector,1,1,"edu",&dev);
+    result = request_irq(edudev->vector,irq_handler,0,"edu",edudev);
+    if (result) {
+        dev_err(&dev->dev, "Failed to request IRQ\n");
+        goto err_irq_request;
+    }
 
     edudev->miscdev = (struct miscdevice){
         .minor = MISC_DYNAMIC_MINOR,
@@ -163,8 +199,9 @@ static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
     
     
     return 0;
-
 err_misc_register:
+    free_irq(edudev->vector, edudev); //free the allocated vector
+err_irq_request:
     pci_free_irq_vectors(dev); //free the allocations
 err_alloc_irqvectors:
     iounmap(edudev->io_base); //unmap the BAR0 region from virtual Kernel Space
@@ -182,6 +219,8 @@ static void remove(struct pci_dev* dev){
     misc_deregister(&edudev->miscdev); //deregister the misc device inside the edudev
     
     //We unmap, then release the claimed memory in said order
+    free_irq(edudev->vector, edudev);
+    pci_free_irq_vectors(dev);
     iounmap(edudev->io_base); //unmap the BAR0 region from virtual Kernel Space
     pci_release_region(dev, 0); //release the claimed BAR0 region
     pci_disable_device(dev);
