@@ -62,7 +62,7 @@ static irqreturn_t irq_handler(int irq, void *dev_id) {
     }
     iowrite32(result, edudev->io_base + INTERRUPT_ACK_REGISTER); //write result to the interrupt acknowledge register to clear the interrupt
 
-    complete(&work_done); //wakes up the thread
+    complete(&edudev->work_done); //wakes up the thread
     return IRQ_HANDLED; 
 }
 
@@ -80,7 +80,7 @@ static ssize_t read_driver(struct file *filp, char __user *user_buf, size_t len,
     //so we need to remove the polling part and replace it with the interrupt stuff. For now, we need to figure out WHERE the function goes to sleep and it is right here
     //after it wakes up, it then reads and copies to user - so let's just put the wait_for_completion here and see if it works. 
 
-    completion_result = wait_for_completion_interruptible(&work_done); //this is a macro that puts the thread to sleep until the ISR wakes it up
+    completion_result = wait_for_completion_interruptible(&edudev->work_done); //this is a macro that puts the thread to sleep until the ISR wakes it up
     if (completion_result) { //if the thread was interrupted by a signal, we need to return an error code
         return -ERESTARTSYS; //return an error code that indicates that the operation should be restarted
     }
@@ -112,7 +112,7 @@ static ssize_t write_driver(struct file *filp, const char __user *user_buf, size
         return -EOVERFLOW; //overflow error code. This is because the factorial of numbers greater than 12 will overflow a 32-bit unsigned integer
     }
 
-    reinit_completion(&work_done); //reinitialize the completion struct to reset the 'done' field to 0 and the waiting queue to empty. This is used to prevent the thread from waking up before the ISR has been called
+    reinit_completion(&edudev->work_done); //reinitialize the completion struct to reset the 'done' field to 0 and the waiting queue to empty. This is used to prevent the thread from waking up before the ISR has been called
     
     //arm the interrupt
     iowrite32(STATUS_REGISTER_BIT_7_MASK, edudev->io_base + STATUS_REGISTER); //write to the status register to arm the interrupt. This is done by setting the 7th bit of the status register to 1
