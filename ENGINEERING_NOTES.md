@@ -280,6 +280,137 @@ All cases pass.
 
 ---
 
+---
+
+# Phase 3: MSI Interrupt-Driven I/O
+
+We need to use MSI for interrupts. It is what PCI devices use. The one reason we're doing this is to make the read non-polling and interrupt based, instead of the busy-wait loop from Phase 2.
+
+## Interrupt Register Map
+
+* **Status Register (0x20), bit 7 (0x80):** The document describes this as "raise interrupt after finishing factorial computation." So when this bit is set, the device raises an interrupt when the factorial finishes. That interrupt is what takes us into read. read no longer needs to poll with a while loop and `cpu_relax()`. The result collection now only happens as a consequence of the interrupt.
+* **Interrupt Status Register (0x24), RO:** Contains the value(s) that raised the interrupt. This is what the ISR reads to decode the cause.
+* **Interrupt Raise Register (0x60), WO:** Writing here raises an interrupt. The written value gets placed into the interrupt status register. We never write here in normal flow, the device raises on its own.
+* **Interrupt Acknowledge Register (0x64), WO:** Writing here clears an interrupt. The value gets cleared from the interrupt status register. This must be done from the ISR to stop generating interrupts.
+
+**IRQ controller note:** an IRQ is generated when the interrupt raise register is written. The device runs on INTx by default. Even if the driver only uses MSI, it still needs to update the ack register at the end of the IRQ handler routine.
+
+Source worth keeping: https://blog.davidv.dev/posts/learning-pcie/
+
+## INTx vs MSI
+
+**INTx:** the legacy model as described in the documentation. It is a physical wire that the device holds asserted. It is shared among devices, so the line stays high until something causes the device to deassert it. Because it is shared, a handler on a real system also has to check whether it was actually its own device before doing anything. Four shared lines (A to D). Slower. Supported by older OS and BIOS.
+
+**MSI:** a memory write. The device writes a specific data payload to a specific address, and that write is the interrupt. Edge-triggered. No shared line. One event, one message. Faster. Requires OS and hardware support (which we have). Each interrupt can be specialized to a different purpose.
+
+Reference: https://docs.kernel.org/PCI/msi-howto.html#what-are-msis
+
+### MSI vs MSI-X
+
+* MSI uses a single contiguous block of memory for up to 32 interrupts.
+* MSI-X is an extension allowing up to 2048 independent interrupts.
+
+## Allocating and Registering the Interrupt
+
+**`pci_alloc_irq_vectors`:** allocate the vector.
+* Returns an integer, the number of allocated vectors. Returns `-ENOSPC` if fewer than `min_vecs` interrupt vectors are available, other errnos otherwise (quoted from the kernel website).
+* Takes `struct pci_dev *dev`, our PCI device to operate on.
+* Takes `unsigned int min_vecs`, the minimum required number of vectors, which must be greater than or equal to 1.
+* Takes `unsigned int max_vecs`, the max vectors.
+* Takes `unsigned int flags`. We use `PCI_IRQ_MSI`, which is used for MSI vector allocation.
+
+**Fetch the IRQ number:** `pci_irq_vector`.
+
+**Register the ISR:** `request_irq`, the handler for an interrupt line.
+* `unsigned int irq`: interrupt line to allocate. With MSI there is no line, but the kernel keeps the old abstraction and treats it as if it were a line. So we fetch this using `pci_irq_vector`.
+* `irq_handler_t handler`: the function called when the IRQ occurs, which is our ISR. So how do we make that? We write a function declaration first, use its name in `request_irq`, then fill it in later.
+* `unsigned long flags`: handling flags.
+* `const char *name`: name of the device generating the interrupt.
+* `void *dev`: cookie passed to the handler function.
+
+On the flags argument: upon research, this should be **zero**. Flags describe properties of an interrupt line. MSI has no wire, so nothing needs to be put there.
+
+## The Concurrency Rule for ISRs
+
+One important note: the ISR cannot sleep, and a mutex can sleep, so a mutex in interrupt context is a bug. Do not use a mutex for state shared with an ISR. We cannot.
+
+## The Mental Model: Sleep, Get Woken, Wake Up, Collect
+
+I understand how interrupts work normally for a generic function like `read()`, but from different videos and sources I was unclear on how we actually treat the interrupt in this specific case. It did not seem like the normal version where we enable interrupts, the interrupt happens, we call an ISR, and it wakes up the function.
+
+Final picture, clear now: our `read()` function arms the device the way we would arm interrupts in bare-metal. The device starts the work, but then `read()` sleeps in the middle, like the task functions from the RTOS project. While it is sleeping, the CPU is free to do anything, there is no busy-wait polling. To wake it up, we use an ISR.
+
+Initially I kept thinking that `read()` itself should be the ISR, but no. We need to keep read and write together in the same scope, and there are reasons to keep the ISR separate (it uses a spinlock discipline to keep things safe, and read/write need protection from overwriting or reading the wrong thing). So the ISR wakes up the `read()` function from the point where it was sleeping, and `read()` continues to collect the result. The ISR fires because the hardware raised an interrupt, and the hardware raised the interrupt because the device finished computing the factorial of the input written by `write()`.
+
+Concept in one line: sleep, get woken, wake up, and collect.
+
+### Big-Picture Flow
+
+Allocate (probe: MSI vector + `request_irq`) -> `read()` runs: arms the interrupt trigger -> sleeps -> (device computes until then) -> device raises the IRQ on its own -> ISR runs: read 0x24 (which cause) -> write it to 0x64 -> wake the sleeper -> `read()` resumes -> `ioread32` result from 0x08 -> `copy_to_user` -> return.
+
+## Notes While Coding
+
+* Updating the goto ladder as we go.
+* `pci_alloc_irq_vectors` -> `pci_irq_vector` to store the vector number of the first MSI vector we just allocated -> `request_irq`, which needs the vector number, the `irq_handler` (our ISR, which I have to write myself), the `flags` long (figured out to be zero), the name, and `edudev`.
+
+### Working on the ISR
+
+My thought process:
+* This is the ISR, it handles the moment the interrupt fires.
+* We need to wake the `read()` function from its sleep state using this ISR.
+* Is there a specific Linux way to do this, or do I play with registers directly? Let's see.
+* One thing we definitely do here is clear the interrupt using the interrupt ack register.
+* But how does it wake the function, and how do we send the function to sleep in the first place? Researching that. It turns out you use `wait_event_interruptible()` to sleep and `wake_up_interruptible()` to wake up.
+* We need to declare the wait queue first and have a flag condition variable.
+* So a skeleton of the ISR would be: set the flag to something the `read()` thread recognizes as a change, then wake up the queue using the queue declared at the start with `DECLARE_WAIT_QUEUE_HEAD`, then return.
+* Now that I know the basic way, let's use something better that the internet suggests: `struct completion`. It removes the need to manage a custom flag and a manual sleep/wake.
+* https://www.kernel.org/doc/Documentation/scheduler/completion.txt
+* https://embetronicx.com/tutorials/linux/device-drivers/completion-in-linux/
+* I don't know why the first link renders weird, but it has all the info we need on completion.
+
+## Completion Notes
+
+* It is a struct with an unsigned int `done` and a `wait_queue_head_t`.
+* You can use `DECLARE_COMPLETION` to declare the struct instance at the start.
+* I did not use `DECLARE_COMPLETION` in the end, because I realized it should be an `edudev`-specific component, like the vector and `io_base`.
+* So I used the normal declaration: `struct completion work_done;` inside the struct, then in probe I called `init_completion(&edudev->work_done)`. That initializes the completion struct, which sets the done flag to 0 and clears the wait queue.
+
+### Why Completion Instead of a Raw Wait Queue
+
+One thing I was thinking about: there is an obvious race where `read()` might sleep after the interrupt has already been raised. If that happens, it can never be woken up. To handle this we use `struct completion`, which has a wait queue and a done flag. The wakeup is remembered. It does not matter whether the ISR fires before or after we reach the wait. This is mainly for synchronization.
+
+## The Sequence I'm Working With
+
+1. Use `pci_alloc_irq_vectors` first to allocate the vectors.
+2. Extract the vector, then use `request_irq`.
+3. Register the ISR. (Set the DMA mask now too, since I'll need it later anyway.)
+4. Check the readFlag, and if good, do `reinit_completion`.
+5. Set 0x80 in the status register to arm the interrupt, write the input to 0x08, then `wait_for_completion_interruptible` to sleep. On wake, `ioread32` the result from 0x08, `copy_to_user` as usual, and we're good.
+6. The ISR: this fires after the device finishes. `ioread32` from 0x24, `iowrite32` that value to 0x64, `complete`, and return `IRQ_HANDLED`.
+
+## Final Flow (Written)
+
+* Declare a completion struct at the top (as an `edudev` member).
+* Declare the `irqreturn_t` function (our ISR) at the top.
+* Write the ISR itself: read the interrupt status register (0x24) to determine the cause, write that value to the interrupt acknowledge register (0x64) to clear the interrupt, wake the thread using `complete(&edudev->work_done)`, and return `IRQ_HANDLED`.
+* In `write()`: do `reinit_completion` to reset the done field to 0 and empty the wait queue, arm the interrupt by setting bit 7 of the status register, then write the input number to the factorial computation register.
+* I got confused about when to actually trigger the interrupt, but it makes sense that the trigger is device-side, not something our software does.
+
+## Spinlock Reasoning
+
+* **Spinlock:** a low-level synchronization primitive where a thread or CPU core continuously polls a lock variable in a tight loop until it becomes available. It burns CPU while waiting. Taking the lock disables interrupts on that core, for one specific reason: to stop the ISR from firing on the same core while process-context code holds the lock.
+* The danger case: `read()` grabs the lock and gets to work. An interrupt fires on the same CPU, and the ISR tries to grab the same lock. But `read()` holds it and stays suspended, waiting on the ISR to wake it. The ISR spins forever. Deadlock.
+* In our case, the ISR writes to device registers and does not touch `readFlag`, which is the variable shared between read and write. So for this design I concluded no spinlock is needed.
+
+## New Pattern: Read-Modify-Write on Registers
+
+A cleaner way to set a bit in a register for Linux driver work:
+* Read the register value into a variable.
+* `value |= bit;` to set the specific bit in that value.
+* Write the variable back into the register with `iowrite32`.
+
+---
+
 # Syntax Notes
 
 * A new return type I just learned about is `ssize_t`. This returns the amount of bytes that were read successfully.
