@@ -1,6 +1,6 @@
 #!/bin/bash
 qemu-system-x86_64 \
-  -machine q35 \
+  -machine q35,kernel-irqchip=split \
   -m 2048 \
   -smp 2 \
   -drive file=ubuntu.img,format=qcow2,if=virtio \

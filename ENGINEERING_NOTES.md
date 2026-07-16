@@ -411,6 +411,33 @@ A cleaner way to set a bit in a register for Linux driver work:
 
 ---
 
+## Debugging the Missing Interrupt
+
+The interrupt-driven read hung indefinitely. Instead of guessing if the ISR or completion logic was broken, I am trying to break down the problem. 
+
+### 1. Verify the Running Module
+* **Symptom:** Debug prints missing from `dmesg`. 
+* **Cause:** Loading a stale `.ko` file instead of the edited source.
+* **Lesson:** Always clean rebuild (`rmmod`, `make clean && make`, `insmod`) and verify debug prints exist before debugging behavior. 
+
+### 2. Prove Each Layer (Bottom-to-Top)
+* **Arming:** Read back the Status Register (`0x20`) after the arm write. Received `0x80` (Bit 7 stuck). The arm held.
+* **Computing:** Read back `0x20` after the trigger write. Received `0x81` (Bits 7 and 0 set). Compute path confirmed working.
+* **Verification:** Checked `/proc/interrupts` after a write. Count stayed at 0. The device was computing, but the handler never ran.
+
+### 3. Isolate Device from Delivery
+I wrote to the EDU device's manual raise register (`0x60`) during `probe` to bypass the factorial compute entirely. The write executed, but the ISR still never fired and the interrupt count stayed at 0. This proved the problem was purely delivery: the MSI message was not reaching the registered handler.
+
+### 4. Confirm System Configuration
+`lspci -v -s 00:02.0` showed `MSI: Enable+`. The allocation returned vector 36, perfectly matching `/proc/interrupts`. Allocation, enable state, and mapping were all correct. 
+
+### Conclusion
+**Not a driver bug.** The correct driver hit an MSI delivery limitation in the emulated interrupt fabric on the `q35` machine under TCG (no KVM). 
+* **The Fix:** Adjust the QEMU launch config. Try `kernel-irqchip=split`, then `kernel-irqchip=off`, then fallback to the `pc` (i440fx) machine.
+
+### Key Takeaway
+Bisecting a missing interrupt by proving each layer in turn (arm readback -> compute busy bit -> isolate delivery via manual raise) is the exact process used on real silicon for IOAPIC or MSI routing bugs. The `0x60` manual-raise trick is the ultimate "delivery probe" to keep on hand when an interrupt goes missing.
+
 # Syntax Notes
 
 * A new return type I just learned about is `ssize_t`. This returns the amount of bytes that were read successfully.
