@@ -108,6 +108,8 @@ the acknowledge register (0x64), then calls `complete()` to wake the reader. The
 resumes, reads the result from 0x08, copies it to userspace, and returns.
  
 ### Key design decisions
+
+Check my [ENGINEERING_NOTES](ENGINEERING_NOTES.md) file for more information on these design decisions. A lot of debugging went into completing this phase of the project. The difference was a single line `pci_set_master`. 
  
 - **`struct completion` over a raw wait queue.** A completion is a wait queue plus a done
   flag plus the locking that makes them race-free. The device can finish and fire the
