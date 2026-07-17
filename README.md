@@ -82,3 +82,70 @@ sudo ./edu_test
 - Input 13 returns -EOVERFLOW (13! overflows u32)
 - Read before write returns -EAGAIN
 - Wrong length returns -EINVAL
+
+## MSI interrupt-driven I/O
+ 
+Phase 2 worked by polling: `read()` spun on the status register until the device
+cleared the busy bit, burning a CPU core just to wait. Phase 3a replaces that with
+a real interrupt. The device signals when it is finished, and the reading process
+sleeps until then instead of spinning.
+ 
+### How it works
+ 
+The flow spans two contexts. The `write()`/`read()` path runs in process context and
+can sleep. The interrupt handler runs in interrupt context and cannot sleep. They coordinate
+through a `struct completion`.
+ 
+`write()` arms the interrupt by setting bit 7 (`0x80`) in the status register (0x20),
+then writes the input to the factorial register (0x08) to start the computation. Order
+matters: the device checks the interrupt-enable bit when the computation finishes, so
+arming must happen before the trigger.
+ 
+`read()` calls `wait_for_completion_interruptible`, which sleeps and hands the CPU back
+to the system. When the device finishes, it raises an MSI. The handler reads the interrupt
+status register (0x24) to confirm the cause, acknowledges it by writing that value back to
+the acknowledge register (0x64), then calls `complete()` to wake the reader. The reader
+resumes, reads the result from 0x08, copies it to userspace, and returns.
+ 
+### Key design decisions
+ 
+- **`struct completion` over a raw wait queue.** A completion is a wait queue plus a done
+  flag plus the locking that makes them race-free. The device can finish and fire the
+  interrupt before `read()` reaches its sleep call. A bare wait queue would lose that wake
+  and the reader would sleep forever; a completion records that the event happened, so a
+  later wait returns immediately. `reinit_completion` runs at the start of each write so a
+  stale completion cannot let the next read return early.
+- **MSI, not INTx.** The driver requests one MSI vector with `pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI)`
+  and gets the IRQ number from `pci_irq_vector`, not `pdev->irq`. The `request_irq` flags are 0,
+  since an MSI vector is dedicated, not a shared wire.
+- **The acknowledge quirk.** The device requires the acknowledge register to be written even
+  under MSI. Under INTx, skipping it leaves the line asserted and the handler fires forever.
+  Under MSI there is no line, but the status register keeps its stale bits, which corrupts the
+  next decode. So the handler acks the exact value it read.
+- **Bus mastering.** `probe()` calls `pci_set_master`. An MSI is delivered as a memory write,
+  and a PCI device can only initiate writes if it is a bus master. Without this the device
+  raised the interrupt but the write was dropped and the handler never ran. DMA also depends on the same permission.
+- **Concurrency.** The only state shared between the handler and the file operations is the
+  completion, which is internally locked, so no spinlock is needed here. A mutex would not be
+  an option anyway, since the handler cannot sleep and a mutex can.
+### Teardown
+ 
+`remove()` releases the handler with `free_irq` before releasing the vector with
+`pci_free_irq_vectors`, so no interrupt can arrive after the handler is gone. Bus mastering is
+cleared with `pci_clear_master`, and the rest unwinds in reverse order of setup.
+ 
+### Verifying it works
+ 
+```bash
+cd /mnt/host/src && make && sudo insmod edu.ko
+ 
+# Handler registered, count starts at 0
+cat /proc/interrupts | grep edu
+ 
+# Trigger a factorial
+printf '\x05\x00\x00\x00' | sudo tee /dev/edu > /dev/null
+sudo od -An -tu4 /dev/edu
+ 
+# Count is now 1: the result came via a real interrupt, not the old busy-poll
+cat /proc/interrupts | grep edu
+```
