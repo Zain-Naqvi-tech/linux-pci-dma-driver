@@ -86,7 +86,7 @@ sudo ./edu_test
 ## MSI interrupt-driven I/O
  
 Phase 2 worked by polling: `read()` spun on the status register until the device
-cleared the busy bit, burning a CPU core just to wait. Phase 3a replaces that with
+cleared the busy bit, burning a CPU core just to wait. It replaces that with
 a real interrupt. The device signals when it is finished, and the reading process
 sleeps until then instead of spinning.
  
