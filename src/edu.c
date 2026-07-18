@@ -6,16 +6,24 @@
 
 #define STATUS_REGISTER 0x20
 #define FACTORIAL_COMPUTATION_REGISTER 0x08
+
 #define STATUS_REGISTER_BIT_0_MASK 0x01
 #define STATUS_REGISTER_BIT_7_MASK 0x80
+
 #define INTERRUPT_STATUS_REGISTER 0x24 //contains the value which raised the interrupt (used at the start of an ISR)
 #define INTERRUPT_ACK_REGISTER 0X64 //clears an interrupt (used at the end of an ISR)
+
+#define DMA_SOURCE_ADDRESS_REGISTER 0x80 //where to perform the DMA from
+#define DMA_DESTINATION_ADDRESS_REGISTER 0x88 //where to perform the DMA to
+#define DMA_TRANSFER_COUNT 0x90 //the size of the area to perform the DMA on
+#define DMA_COMMAND_REGISTER 0x98 //Bitwise OR of 0x01, 0x02, and 0x04 to start, fill the direction, and raise interrupt respectively
 
 #include <linux/module.h> //all kernel modules
 #include <linux/pci.h> //used to interact with PCI drivers and devices
 #include <linux/init.h> //__init and __exit macros 
 #include <linux/miscdevice.h> //used to create a misc device
 #include <linux/fs.h> //used for file operations struct
+#include <linux/dma-mapping.h> //used for DMA operations
 
 MODULE_LICENSE("GPL"); 
 MODULE_AUTHOR("Zain");
@@ -27,6 +35,9 @@ static irqreturn_t irq_handler(int irq, void *dev_id);
 
 //read function: polls the EDU's status register to see if the first bit clears. Then, it reads the result in factorial computation register (0x08) 
 static ssize_t read_driver(struct file *filp, char __user *user_buf, size_t len, loff_t *offset);
+
+//DMA Transfer function: Moves memory
+static int dma_transfer(struct edu_device *edudev, size_t size, int direction);
 
 //write function: Write the input number to the factorial computation register (0x08). 
 static ssize_t write_driver(struct file *filp, const char __user *user_buf, size_t len, loff_t *offset);
@@ -44,6 +55,9 @@ struct edu_device {
     u32 readFlag; //shared flag to indicate if something has been written to the register. This is used to prevent reading from the register before something has been written to it
     u32 vector;
     struct completion work_done; //completion struct to put the thread to sleep until the ISR wakes it up
+    struct completion dma_work_done; //completion struct for the DMA process
+    dma_addr_t dma_handle; //tells the device which memory address to read from and write to
+    void *cpu_addr; //cpu address 
 };
 
 static struct file_operations fops = {
@@ -55,15 +69,57 @@ static struct file_operations fops = {
 //The ISR
 static irqreturn_t irq_handler(int irq, void *dev_id) {
     struct edu_device *edudev = dev_id; //get an edu_device instance using the dev_id being passed in
+    u32 result;
 
-    u32 result = ioread32(edudev->io_base + INTERRUPT_STATUS_REGISTER); //read the interrupt status register to determine the cause of the interrupt
+    result = ioread32(edudev->io_base + INTERRUPT_STATUS_REGISTER); //read the interrupt status register to determine the cause of the interrupt
     if (result == 0) { //if the interrupt status register is 0, that means that the interrupt was not caused by our device
         return IRQ_NONE; //return IRQ_NONE to indicate that the interrupt was not handled
     }
     iowrite32(result, edudev->io_base + INTERRUPT_ACK_REGISTER); //write result to the interrupt acknowledge register to clear the interrupt
+    if (result && 0x1) { //if the result shows that the cause is the factorial computation interrupt
+        complete(&edudev->work_done); //wakes up the read() thread
+    }
+    if (result && 0x100) { //if the result shows that the cause is the DMA 'done' interrupt
+        complete(&edudev->dma_work_done); //wakes up the DMA thread to complete the DMA transfer
+    }
 
-    complete(&edudev->work_done); //wakes up the thread
     return IRQ_HANDLED; 
+}
+
+static int dma_transfer(struct edu_device *edudev, size_t size, int direction) {
+
+    int dma_command_register = 0;
+    int completion_result;
+
+    if (direction) { //EDU to RAM - Reading from the device
+        iowrite32(0x40000, edudev->io_base + DMA_SOURCE_ADDRESS_REGISTER);
+        iowrite32(edudev->cpu_addr, edudev->io_base + DMA_DESTINATION_ADDRESS_REGISTER);
+        iowrite32(size, edudev->io_base + DMA_TRANSFER_COUNT);
+        dma_command_register = (0x01 | 0x02 | 0x04); //start transfer, EDU to RAM (direction is 1), raise interrupt after finishing
+        iowrite32(dma_command_register, edudev->io_base + DMA_COMMAND_REGISTER);
+        completion_result = wait_for_completion_interruptible(&edudev->dma_work_done); //wait for the DMA transfer to complete
+        if (completion_result) { 
+            return -ERESTARTSYS; //return an error code that indicates that the operation should be restarted
+        }
+        else {
+            return 0; //Return 0 to indicate success
+        }
+    }
+
+    else { //RAM to EDU - Writing to the device
+        iowrite32(edudev->cpu_addr, edudev->io_base + DMA_SOURCE_ADDRESS_REGISTER); //write the cpu_addr to the Source address register
+        iowrite32(0x40000, edudev->io_base + DMA_DESTINATION_ADDRESS_REGISTER); //write the 0x40000 address to DMA destination address register
+        iowrite32(size, edudev->io_base + DMA_TRANSFER_COUNT); //write the size variable to the Transfer count register to determine the SIZE of the memory being transferred
+        dma_command_register = (0x01 | 0x00 | 0x04); //Start transfer, RAM to edu (direction is 0), raise interrupt after finishing 
+        iowrite32(dma_command_register, edudev->io_base + DMA_COMMAND_REGISTER); //write the command to the command register to start the transfer
+        completion_result = wait_for_completion_interruptible(&edudev->dma_work_done); //wait for the DMA transfer to complete. This puts the thread to sleep until the ISR wakes it up
+        if (completion_result) { 
+            return -ERESTARTSYS; //return an error code that indicates that the operation should be restarted
+        }
+        else {
+            return 0; //return 0 to indicate success
+        }
+    }
 }
 
 static ssize_t read_driver(struct file *filp, char __user *user_buf, size_t len, loff_t *offset) {
@@ -124,61 +180,72 @@ static ssize_t write_driver(struct file *filp, const char __user *user_buf, size
 }
 
 //breif function is called when a PCI device is registered. It takes in dev and id information
-static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
+static int probe(struct pci_dev* pcidev, const struct pci_device_id* id) {
 
     u32 registerValue; //32 bit unsigned integer to store the value read from the BAR0 region
     int result;
 
     //using device manager kzalloc to allocate memory for the edu_device struct. 
-    struct edu_device *edudev = devm_kzalloc(&dev->dev, sizeof(*edudev), GFP_KERNEL);
+    struct edu_device *edudev = devm_kzalloc(&pcidev->dev, sizeof(*edudev), GFP_KERNEL);
     if (!edudev) {
         return -ENOMEM;
     }
 
     init_completion(&edudev->work_done); //initialize the completion struct to set the 'done' field to 0 and the waiting queue to empty. This is used to put the thread to sleep until the ISR wakes it up
+    init_completion(&edudev->dma_work_done); //initialize the completion struct for dma_work_done
 
     //STORE
-    dev_set_drvdata(&dev->dev, edudev); //store the pointer to the edu_device struct in the dev->dev->driver_data field. This is used to retrieve the struct in remove()
+    dev_set_drvdata(&pcidev->dev, edudev); //store the pointer to the edu_device struct in the dev->dev->driver_data field. This is used to retrieve the struct in remove()
 
     //ENABLE
-    result = pci_enable_device(dev); //takes in the pointer to the PCI device. Wakes up the device and PCI bridge, along with allocation of resources like I/O ports and memory regions
+    result = pci_enable_device(pcidev); //takes in the pointer to the PCI device. Wakes up the device and PCI bridge, along with allocation of resources like I/O ports and memory regions
     if (result) { //error is non-zero
-        dev_err(&dev->dev, "Failed to enable PCI device\n");
+        dev_err(&pcidev->dev, "Failed to enable PCI device\n");
         return result; //straight return, no goto ladder used
     }
 
-    pci_set_master(dev); //enable bus mastering for the device
+    pci_set_master(pcidev); //enable bus mastering for the device (for both interrupts and DMA)
 
     //  CLAIM BAR0 REGION
-    result = pci_request_region(dev, 0, "edu");
+    result = pci_request_region(pcidev, 0, "edu");
     if (result) { //request the first BAR region of the device. This is the memory region that the device uses to communicate with the CPU. The second argument is the BAR number, and the third argument is a name for the region
-        dev_err(&dev->dev, "Failed to request PCI region\n");
+        dev_err(&pcidev->dev, "Failed to request PCI region\n");
         //we need to use goto here to GO TO the area which disables it
         goto err_disable_device; //goto is used to jump to a label. In this case, we are jumping to the label that disables the device and returns an error code
     } 
 
     //MAP BAR0 REGION
-    edudev->io_base = ioremap(pci_resource_start(dev, 0), pci_resource_len(dev, 0)); //Base of BAR0 is the first argument, and the length of BAR0 is the second argument. This maps the physical address of BAR0 to a virtual address in kernel space. The return value is a pointer to the virtual address, which we store in io_base
+    edudev->io_base = ioremap(pci_resource_start(pcidev, 0), pci_resource_len(pcidev, 0)); //Base of BAR0 is the first argument, and the length of BAR0 is the second argument. This maps the physical address of BAR0 to a virtual address in kernel space. The return value is a pointer to the virtual address, which we store in io_base
     if (!(edudev->io_base)) { //if NULL
-        dev_err(&dev->dev, "Failed to Map\n");
+        dev_err(&pcidev->dev, "Failed to Map\n");
         result = -ENOMEM; //macro that returns an error code for 'out of memory'
         goto err_release_region;        
     }
 
     //allocate MSI vectors
-    result = pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI); //request 1 MSI vector. The first argument is the pointer to the PCI device, the second argument is the minimum number of vectors we want, the third argument is the maximum number of vectors we want, and the fourth argument is the type of interrupt we want (MSI in this case)
+    result = pci_alloc_irq_vectors(pcidev, 1, 1, PCI_IRQ_MSI); //request 1 MSI vector. The first argument is the pointer to the PCI device, the second argument is the minimum number of vectors we want, the third argument is the maximum number of vectors we want, and the fourth argument is the type of interrupt we want (MSI in this case)
     if (result < 0) { //returns the number of vectors allocated or an error code (negative)
-        dev_err(&dev->dev, "Failed to allocate MSI vector\n");
+        dev_err(&pcidev->dev, "Failed to allocate MSI vector\n");
         goto err_alloc_irqvectors;
     }
 
-    edudev->vector = pci_irq_vector(dev, 0); //get the vector number of the first MSI vector hence the nr as 0. This needs to be passed into the request_irq function
+    edudev->vector = pci_irq_vector(pcidev, 0); //get the vector number of the first MSI vector hence the nr as 0. This needs to be passed into the request_irq function
     //request irq
     result = request_irq(edudev->vector,irq_handler,0,"edu",edudev);
     if (result) {
-        dev_err(&dev->dev, "Failed to request IRQ\n");
+        dev_err(&pcidev->dev, "Failed to request IRQ\n");
         goto err_irq_request;
     }
+
+    //set DMA Coherent mask
+    result = dma_set_mask_and_coherent(&pcidev->dev, DMA_BIT_MASK(28));
+    if (result) {
+        dev_err(&pcidev->dev, "Failed to set DMA mask\n");
+        goto err_dma_mask;
+    }
+
+    //allocate RAM for the region
+    edudev->cpu_addr = dma_alloc_coherent(&pcidev->dev, 4096, &edudev->dma_handle, GFP_KERNEL); //allocate 4KB of coherent memory. It returns the virtual address which you can use to access it from the CPU and the dma_handle (changed by pass-by-reference) which is the physicall address that the device can use
 
     edudev->miscdev = (struct miscdevice){
         .minor = MISC_DYNAMIC_MINOR,
@@ -199,31 +266,35 @@ static int probe(struct pci_dev* dev, const struct pci_device_id* id) {
     
     
     return 0;
+    
 err_misc_register:
+    dma_free_coherent(&pcidev->dev, 4096, edudev->cpu_addr, edudev->dma_handle); //free the allocated RAM for the DMA region
+err_dma_mask:
     free_irq(edudev->vector, edudev); //free the allocated vector
 err_irq_request:
-    pci_free_irq_vectors(dev); //free the allocations
+    pci_free_irq_vectors(pcidev); //free the allocations
 err_alloc_irqvectors:
     iounmap(edudev->io_base); //unmap the BAR0 region from virtual Kernel Space
 err_release_region:
-    pci_release_region(dev, 0); //to avoid leaks
+    pci_release_region(pcidev, 0); //to avoid leaks
 err_disable_device:
-    pci_disable_device(dev); //disables the device and releases resources
+    pci_disable_device(pcidev); //disables the device and releases resources
     return result;
 }
 
 //brief function is called when a PCI device is unregistered. It takes in dev information
-static void remove(struct pci_dev* dev){
+static void remove(struct pci_dev* pcidev){
     //RECOVER the struct, deregister the misc device, and continue with the fail-safe exit
-    struct edu_device *edudev = dev_get_drvdata(&dev->dev); //get the pointer to the edu_device struct that we allocated in probe. This is stored in the dev->dev->driver_data field, which we can access using dev_get_drvdata
+    struct edu_device *edudev = dev_get_drvdata(&pcidev->dev); //get the pointer to the edu_device struct that we allocated in probe. This is stored in the dev->dev->driver_data field, which we can access using dev_get_drvdata
     misc_deregister(&edudev->miscdev); //deregister the misc device inside the edudev
     
-    //We unmap, then release the claimed memory in said order
-    free_irq(edudev->vector, edudev);
-    pci_free_irq_vectors(dev);
+    //We unwind in the opposite order of the probe function
+    dma_free_coherent(&pcidev->dev, 4096, edudev->cpu_addr, edudev->dma_handle); //free the allocated RAM for the DMA region
+    free_irq(edudev->vector, edudev); //free the allocated vector
+    pci_free_irq_vectors(pcidev);
     iounmap(edudev->io_base); //unmap the BAR0 region from virtual Kernel Space
-    pci_release_region(dev, 0); //release the claimed BAR0 region
-    pci_disable_device(dev);
+    pci_release_region(pcidev, 0); //release the claimed BAR0 region
+    pci_disable_device(pcidev);
     pr_info("Removed Device Successfully\n");
 }
 
