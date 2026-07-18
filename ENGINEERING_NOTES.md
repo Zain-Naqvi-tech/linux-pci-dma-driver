@@ -476,6 +476,8 @@ For the mask value, the EDU spec says:
 
 > dma_mask makes the virtual device work with DMA addresses with the given mask. For educational purposes, the device supports only 28 bits (256 MiB) by default. Students shall set dma_mask for the device in the OS driver properly.
 
+![Image of how the DMA process works from the spec](image-1.png)
+
 Source: https://www.qemu.org/docs/master/specs/edu.html#command-line-switches
 
 So we have a 28-bit limit, and we pass `DMA_BIT_MASK(28)` to the mask function. This tells the kernel that any buffer it hands us must sit within the low 28 bits of the address space, because the device can't address anything higher.

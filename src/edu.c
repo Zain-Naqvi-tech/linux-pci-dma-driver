@@ -63,7 +63,8 @@ struct edu_device {
 static struct file_operations fops = {
     .owner = THIS_MODULE,
     .read = read_driver,
-    .write = write_driver
+    .write = write_driver,
+    .unlocked_ioctl = edu_ioctl
 };
 
 //The ISR
@@ -76,10 +77,10 @@ static irqreturn_t irq_handler(int irq, void *dev_id) {
         return IRQ_NONE; //return IRQ_NONE to indicate that the interrupt was not handled
     }
     iowrite32(result, edudev->io_base + INTERRUPT_ACK_REGISTER); //write result to the interrupt acknowledge register to clear the interrupt
-    if (result && 0x1) { //if the result shows that the cause is the factorial computation interrupt
+    if (result & 0x1) { //if the result shows that the cause is the factorial computation interrupt
         complete(&edudev->work_done); //wakes up the read() thread
     }
-    if (result && 0x100) { //if the result shows that the cause is the DMA 'done' interrupt
+    if (result & 0x100) { //if the result shows that the cause is the DMA 'done' interrupt
         complete(&edudev->dma_work_done); //wakes up the DMA thread to complete the DMA transfer
     }
 
@@ -93,7 +94,7 @@ static int dma_transfer(struct edu_device *edudev, size_t size, int direction) {
 
     if (direction) { //EDU to RAM - Reading from the device
         iowrite32(0x40000, edudev->io_base + DMA_SOURCE_ADDRESS_REGISTER);
-        iowrite32(edudev->cpu_addr, edudev->io_base + DMA_DESTINATION_ADDRESS_REGISTER);
+        iowrite32(edudev->dma_handle, edudev->io_base + DMA_DESTINATION_ADDRESS_REGISTER);
         iowrite32(size, edudev->io_base + DMA_TRANSFER_COUNT);
         dma_command_register = (0x01 | 0x02 | 0x04); //start transfer, EDU to RAM (direction is 1), raise interrupt after finishing
         iowrite32(dma_command_register, edudev->io_base + DMA_COMMAND_REGISTER);
@@ -107,7 +108,7 @@ static int dma_transfer(struct edu_device *edudev, size_t size, int direction) {
     }
 
     else { //RAM to EDU - Writing to the device
-        iowrite32(edudev->cpu_addr, edudev->io_base + DMA_SOURCE_ADDRESS_REGISTER); //write the cpu_addr to the Source address register
+        iowrite32(edudev->dma_handle, edudev->io_base + DMA_SOURCE_ADDRESS_REGISTER); //write the dma_handle to the Source address register
         iowrite32(0x40000, edudev->io_base + DMA_DESTINATION_ADDRESS_REGISTER); //write the 0x40000 address to DMA destination address register
         iowrite32(size, edudev->io_base + DMA_TRANSFER_COUNT); //write the size variable to the Transfer count register to determine the SIZE of the memory being transferred
         dma_command_register = (0x01 | 0x00 | 0x04); //Start transfer, RAM to edu (direction is 0), raise interrupt after finishing 
@@ -266,7 +267,7 @@ static int probe(struct pci_dev* pcidev, const struct pci_device_id* id) {
     
     
     return 0;
-    
+
 err_misc_register:
     dma_free_coherent(&pcidev->dev, 4096, edudev->cpu_addr, edudev->dma_handle); //free the allocated RAM for the DMA region
 err_dma_mask:
