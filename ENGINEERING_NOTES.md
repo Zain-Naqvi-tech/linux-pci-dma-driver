@@ -438,6 +438,127 @@ I wrote to the EDU device's manual raise register (`0x60`) during `probe` to byp
 ### Key Takeaway
 Bisecting a missing interrupt by proving each layer in turn (arm readback -> compute busy bit -> isolate delivery via manual raise) is the exact process used on real silicon for IOAPIC or MSI routing bugs. The `0x60` manual-raise trick is the ultimate "delivery probe" to keep on hand when an interrupt goes missing.
 
+---
+
+# DMA
+
+Before starting DMA properly, a note on what actually fixed the MSI milestone: all the device-changing and fiddling wasn't worth it. The real issue was never calling `pci_set_master(dev)`. That call is vital for MSI to run. Once it was in, MSI worked and we were good on that milestone.
+
+## What DMA Actually Is
+
+Direct Memory Access (DMA) is about MOVEMENT. Dynamic Memory Allocation is about OWNERSHIP. Two different things that share an abbreviation, so worth separating up front.
+
+DMA:
+* A system peripheral reading from or writing to system RAM directly.
+* The PCI device itself does the work. The CPU hands over the physical address of a buffer in RAM, the device fills it in (or drains it), and raises an interrupt to the CPU when it is done.
+
+And to do DMA we obviously have to dynamically allocate memory first. The device needs a reserved place in RAM to write its data. So the two concepts are linked in practice even though they mean different things.
+
+## Bus Mastering: Why the Device Needs Permission
+
+The CPU is the master and the PCI device is the target by default. When a device powers on, it is forbidden from initiating its own transactions. Bus mastering flips that permission. When we call `pci_set_master(dev)`, the kernel sets bit 2 in the device's PCI configuration command register. This gives the device permission to act as its own initiator and write directly to system memory on its own. This is the same call that MSI turned out to need, which makes sense: MSI is itself a memory write initiated by the device, so the device has to be a bus master to send it.
+
+## Why Not kmalloc
+
+Notes from a YouTube video on this:
+* So far we have been working with `ioread`/`iowrite`, which are PCI Express inbound transactions (host reaching into the device).
+* The other direction is a PCI Express outbound transaction, the device reaching out to host memory.
+* A DMA controller performs that outbound transaction for us, using the DMA engine on the PCI device.
+* Not much more from that video, it was more focused on MMIO, which I'm not working with right now.
+
+The takeaway is that a plain `kmalloc` buffer is not the right tool. We need memory the device can reach by physical address, which is what the DMA API gives us.
+
+## The DMA Mask
+
+We need to set the DMA mask size. We use `dma_set_mask_and_coherent()` (the combined call that sets both the streaming and coherent masks at once).
+
+For the mask value, the EDU spec says:
+
+> dma_mask makes the virtual device work with DMA addresses with the given mask. For educational purposes, the device supports only 28 bits (256 MiB) by default. Students shall set dma_mask for the device in the OS driver properly.
+
+Source: https://www.qemu.org/docs/master/specs/edu.html#command-line-switches
+
+So we have a 28-bit limit, and we pass `DMA_BIT_MASK(28)` to the mask function. This tells the kernel that any buffer it hands us must sit within the low 28 bits of the address space, because the device can't address anything higher.
+
+## DMA Register Map (from the EDU doc)
+
+* **0x80 (RW): DMA Source Address.** Where to perform the DMA from.
+* **0x88 (RW): DMA Destination Address.** Where to perform the DMA to.
+* **0x90 (RW): DMA Transfer Count.** The size of the region to transfer.
+* **0x98 (RW): DMA Command Register.** Bitwise OR of:
+    * 0x01: start transfer
+    * 0x02: direction (0 = RAM to EDU, 1 = EDU to RAM)
+    * 0x04: raise interrupt 0x100 after finishing the DMA
+
+The main purpose of all this is to answer one question: how do you move N bytes between the host and the device?
+
+The command register locks in the configuration and tells the device to GO. There is a 4096-byte buffer at offset 0x40000 inside the EDU device, so DMA moves data to or from that internal buffer.
+
+Two concrete examples of the command value:
+* **Host RAM to buffer:** command 0x01, start bit only, direction bit clear, so RAM to EDU.
+* **Device buffer to host RAM:** command 0x03 (0x01 | 0x02), start bit plus direction bit set, so EDU to RAM.
+
+(For the real transfers we also OR in 0x04 so the DMA-complete interrupt fires.)
+
+## Coherent vs Streaming DMA
+
+* **Streaming DMA:** for one-off, bulk data transfers. We map a single existing buffer for a single transfer and unmap it after.
+* **Coherent DMA:** for control/shared memory that both the CPU and device access. The mapping stays consistent between CPU and device automatically. We allocate once and keep it.
+
+I looked up which is more common, and it's streaming DMA, because bulk data means more throughput. But we don't need heavy memory movement here. Coherent DMA is fine for this project since it's simpler, lighter weight, and does not require the map/unmap dance on every transfer. So we go coherent.
+
+## The Virtual vs Physical Address Trap
+
+One thing I got stuck on was which address to feed the device. I initially used `cpu_addr` from the `edudev` struct, but after more research I realized the PCI device needs a physical address to move through the memory map.
+
+In Linux, to keep programs from crashing each other, the CPU uses a piece of hardware called the MMU (memory management unit). It creates a contiguous virtual memory space for software to work in.
+
+* **`cpu_addr`: virtual address.** The address the MMU gives to software. When C code reads `cpu_addr[0]`, the MMU catches the request, looks up its mapping table, and forwards it to the physical RAM chip.
+* **`dma_handle`: physical (bus) address.** The PCI device sits outside the CPU. It does not go through the MMU. It needs the true bus address, which is `dma_handle`.
+
+So the rule: the CPU uses `cpu_addr` to VIEW the data, and the device uses `dma_handle` to MOVE it. Both point at the same buffer, just through different doors.
+
+## Design Flow
+
+1. Write out the register definitions at the top.
+2. Include `dma-mapping.h`.
+3. In `probe()`, call `dma_set_mask_and_coherent(dev, DMA_BIT_MASK(28))`. It returns 0 on success, so it goes in the goto ladder so an error is caught if the device can't set the mask.
+4. In `probe()`, call `dma_alloc_coherent(dev, size, &dma_handle, gfp)`, with `dma_addr_t dma_handle;` declared above. This allocates RAM for the region and returns the virtual address (for the CPU) plus the `dma_handle` (for the device). Store both the addr and the handle in `edudev`.
+5. Add a second `struct completion` in `edudev` for DMA (separate from the factorial one).
+6. Use the DMA direction arguments: `DMA_BIDIRECTIONAL`, `DMA_TO_DEVICE`, `DMA_FROM_DEVICE`, `DMA_NONE`.
+7. Free with `dma_free_coherent` in `remove()`, unwinding in reverse order.
+
+### ISR Change for DMA
+
+The ISR now has to handle two causes. Read 0x24, ack it, then branch: 0x1 means the factorial finished, 0x100 means the DMA finished. Each cause completes its own completion struct.
+
+## Designing the Transfer Function
+
+First I checked whether there's an existing kernel function for the transfer. There isn't, so we write our own.
+
+The function takes a size and a direction only. The direction decides the source and destination, so we don't pass those in separately.
+
+* **Direction bit 0: RAM to EDU** (host memory into the device buffer). This is a WRITE to the device.
+* **Direction bit 1: EDU to RAM** (device buffer out to host memory). This is a READ from the device.
+
+For the RAM-to-EDU (TO) case:
+* The DMA source address is the physical DMA address (`dma_handle`), the host buffer.
+* The destination address is 0x40000, the device's internal buffer.
+* Transfer count is the size passed into the function.
+* Command register is the bitwise OR of start (0x01), direction (0x02 clear for RAM to EDU), and raise-interrupt (0x04).
+
+The EDU-to-RAM (FROM) case is the mirror image with the same structure: source is 0x40000, destination is `dma_handle`, and the direction bit is set.
+
+At the end of the transfer, we sleep with `wait_for_completion_interruptible` until the DMA-complete interrupt wakes us.
+
+## The while(1) Question
+
+One thing I need to understand: in some reference implementations the transfer waits in a loop that runs indefinitely, a forever loop, so something must stop it. That something is the DMA-complete interrupt on the device side. The interrupt is what breaks the wait, which is exactly why we route DMA completion through its own completion struct and the ISR branch above.
+
+## ioctl
+
+We have to use ioctl to drive DMA from userspace, since a plain read/write can't carry the direction and size cleanly. This is also the point where the driver and the userspace app will start sharing a header for the ioctl command numbers, which breaks the earlier "they share no headers" assumption from Phase 2.
+
 # Syntax Notes
 
 * A new return type I just learned about is `ssize_t`. This returns the amount of bytes that were read successfully.
