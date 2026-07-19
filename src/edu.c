@@ -87,7 +87,7 @@ static long edu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
     switch (cmd) {
     case EDU_DMA_TO_DEVICE:
         
-        copy_check = copy_from_user(edudev->cpu_addr, (void __user *)local_arg.data_ptr, local_arg.size); //copy the data from the user space buffer to the DMA buffer. This is done before the DMA transfer is started so that the data is in the CPU address space and can be accessed by the device
+        copy_check = copy_from_user(edudev->cpu_addr, (void __user *)(unsigned long)local_arg.data_ptr, local_arg.size); //copy the data from the user space buffer to the DMA buffer. This is done before the DMA transfer is started so that the data is in the CPU address space and can be accessed by the device
         if (copy_check) { return -EFAULT; } //return an error code to show that there were bytes which could not be successfully copied
         result = dma_transfer(edudev, local_arg.size, 0); //dma_transfer function to transfer from RAM to the EDU device. Direction=0 to indicate that the direction is from RAM to EDU
         return result; //return 0 on success or the error code on failure
@@ -95,7 +95,7 @@ static long edu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
     case EDU_DMA_FROM_DEVICE:
 
         result = dma_transfer(edudev, local_arg.size, 1); //transfer from EDU to RAM using the transfer function. Direction is 1 for the opposite direction (EDU to RAM)
-        copy_check = copy_to_user((void __user *)local_arg.data_ptr, edudev->cpu_addr, local_arg.size); //copy the data from the DMA buffer to the user space buffer. This is done after the DMA transfer is complete and the data is in the CPU address space
+        copy_check = copy_to_user((void __user *)(unsigned long)local_arg.data_ptr, edudev->cpu_addr, local_arg.size); //copy the data from the DMA buffer to the user space buffer. This is done after the DMA transfer is complete and the data is in the CPU address space
         if (copy_check) { return -EFAULT; } //return an error code to show that there were bytes which could not be successfully copied
         return result; //return 0 on success or the error code on failure
     

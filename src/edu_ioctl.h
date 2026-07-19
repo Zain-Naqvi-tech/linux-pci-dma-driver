@@ -4,8 +4,8 @@
 #include <linux/ioctl.h> //used for ioctl macros
 
 struct edu_dma_arg {
-    size_t size; //size of the transfer
-    void *data_ptr; //pointer to the actual data to be transferred
+    __u64 size; //size of the transfer
+    __u64 data_ptr; //holds the address to the data payload. This is later typecasted to a void pointer which points to the data
 };
 
 #define EDU_DMA_TO_DEVICE _IOW('z', 0, struct edu_dma_arg) //This is the command that we will use to tell the driver to perform a DMA transfer from RAM to the EDU device
