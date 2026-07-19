@@ -9,6 +9,6 @@ struct edu_dma_arg {
 };
 
 #define EDU_DMA_TO_DEVICE _IOW('z', 0, struct edu_dma_arg) //This is the command that we will use to tell the driver to perform a DMA transfer from RAM to the EDU device
-#define EDU_DMA_FROM_DEVICE _IOR('z', 1, struct edu_dma_arg) //This is the command that tells the driver we want to perform a DMA transfer from the EDU device to RAM
+#define EDU_DMA_FROM_DEVICE _IOW('z', 1, struct edu_dma_arg) //This is the command that tells the driver we want to perform a DMA transfer from the EDU device to RAM
 
 #endif

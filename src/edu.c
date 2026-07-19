@@ -84,6 +84,10 @@ static long edu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
     copy_check = copy_from_user(&local_arg, (void __user*)arg, sizeof(local_arg)); //copy the data from the user space buffer to the local arg struct. This is done before the DMA so that the args data can be easily accessed
     if (copy_check) { return -EFAULT; } //return an error code to show that there were bytes which could not be successfully copied
 
+    if (local_arg.size > 4096) { //check if the size of the transfer is greater than the size of the allocated DMA buffer
+        return -EINVAL; //return an error code that indicates that the argument is invalid
+    }
+
     switch (cmd) {
     case EDU_DMA_TO_DEVICE:
         
@@ -95,6 +99,7 @@ static long edu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
     case EDU_DMA_FROM_DEVICE:
 
         result = dma_transfer(edudev, local_arg.size, 1); //transfer from EDU to RAM using the transfer function. Direction is 1 for the opposite direction (EDU to RAM)
+        if (result) { return result; } //return the error code if the DMA transfer failed (non-zero return)
         copy_check = copy_to_user((void __user *)(unsigned long)local_arg.data_ptr, edudev->cpu_addr, local_arg.size); //copy the data from the DMA buffer to the user space buffer. This is done after the DMA transfer is complete and the data is in the CPU address space
         if (copy_check) { return -EFAULT; } //return an error code to show that there were bytes which could not be successfully copied
         return result; //return 0 on success or the error code on failure
@@ -291,6 +296,12 @@ static int probe(struct pci_dev* pcidev, const struct pci_device_id* id) {
 
     //allocate RAM for the region
     edudev->cpu_addr = dma_alloc_coherent(&pcidev->dev, 4096, &edudev->dma_handle, GFP_KERNEL); //allocate 4KB of coherent memory. It returns the virtual address which you can use to access it from the CPU and the dma_handle (changed by pass-by-reference) which is the physicall address that the device can use
+
+    if (!(edudev->cpu_addr)) { //if NULL
+        dev_err(&pcidev->dev, "Failed to allocate DMA buffer\n");
+        result = -ENOMEM; //returns an error code for 'out of memory'
+        goto err_dma_mask;        
+    }
 
     edudev->miscdev = (struct miscdevice){
         .minor = MISC_DYNAMIC_MINOR,

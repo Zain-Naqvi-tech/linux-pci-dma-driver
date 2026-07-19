@@ -561,6 +561,108 @@ One thing I need to understand: in some reference implementations the transfer w
 
 We have to use ioctl to drive DMA from userspace, since a plain read/write can't carry the direction and size cleanly. This is also the point where the driver and the userspace app will start sharing a header for the ioctl command numbers, which breaks the earlier "they share no headers" assumption from Phase 2.
 
+Source: https://docs.kernel.org/driver-api/ioctl.html
+
+ioctl is the most common way for applications to interface with device drivers. ioctl stands for Input/Output Control, and it is the userspace to kernel command channel.
+
+* The command/request number is the second argument passed to the ioctl system call. We use the defined constants from `uapi/asm-generic/ioctl.h`.
+* INTO THE KERNEL: `_IOW`
+* OUT OF THE KERNEL: `_IOR`
+* BOTH: `_IOWR`
+
+## Why ioctl at All
+
+* ioctl exists for sending structured commands to a driver.
+* The ioctl is the trigger which makes the data move.
+* DMA has parameters such as direction and size. So it needs a command channel rather than a simple read/write, which only carries a byte stream with no room for that metadata.
+* This is the industry standard way real drivers expose device-specific control.
+
+## Notes from the Video Series
+
+From "Let's code a Linux Driver - 12: Introduction to ioctl":
+* The `edu_ioctl` function takes a `struct file *filp` (file pointer), an `unsigned int cmd` (command), and an `unsigned long arg` (arguments). It returns a long. 
+* `arg`: a pointer to the arguments that were passed to the IO control.
+* Make sure the fops struct includes this function using the `.unlocked_ioctl` field.
+
+From "Let's code a Linux Driver - 13: ioctl in a Linux Driver":
+* Make a new `ioctl.h` file.
+* Make a struct with a repeat field and a name array field.
+* Use the macros discussed earlier to define `WR_VAL`, `RD_VAL`, and `GREET` with `_IOW`, `_IOR`, and `_IOW` respectively.
+* In the driver's ioctl function, use a switch statement on `cmd`.
+* In the userspace file, use a switch statement as well.
+
+From "Using ioctl in a Linux PCI or PCI Express Driver":
+* No notes from this one, but a good video to watch before getting into the coding.
+
+## The Direction Macros: What They Actually Describe
+
+Note on the three macros (`_IO`, `_IOW`, `_IOR`): the direction is from userspace's point of view, and it describes the **arg data**, not the DMA direction.
+
+* `_IOW`: userspace writes data into the kernel, so the kernel reads arg.
+* `_IOR`: the kernel writes data back into userspace.
+* `_IO`: no argument at all.
+
+My first instinct was that "DMA buffer to device" means data is going into the kernel, therefore `_IOW`, and "from device" means reading, therefore `_IOR`. That instinct is wrong, and correcting it took a while. See the section further down.
+
+## First Draft of the Flow
+
+1. Make a new header file. It will be a Shared ABI Header, something both userspace and the driver see. From the video, we know it must hold the `_IO`/`_IOW` style defines. So we need an identifier (magic number) for the device, plus `EDU_DMA_TO_DEVICE` and `EDU_DMA_FROM_DEVICE` definitions.
+2. `EDU_DMA_TO_DEVICE _IOW('z', 0, struct dma_arg)`
+3. `EDU_DMA_FROM_DEVICE _IOW('z', 1, struct dma_arg)`
+4. Put `edu_ioctl` in the fops struct under `.unlocked_ioctl`.
+5. Declare and define `edu_ioctl` in our codebase, taking a file pointer, a command, and an argument.
+6. Inside `edu_ioctl`, use a switch statement for our two cases, and use `copy_to_user`/`copy_from_user` in those cases. The reason we need the copy functions is to cross the kernel/userspace boundary. For instance, when we do DMA from the device, after `dma_transfer` returns, the device's data is sitting in `cpu_addr`, and the user's program must be able to read it.
+7. Now go to the userspace `.c` file. We call `ioctl` and feed in the file descriptor and our preprocessor constant. We also allocate the 4KB payload buffer there using the appropriate allocation.
+8. `arg` is filled in on the userspace side, keep that in mind while coding.
+9. Final memory movement in `edu_ioctl`:
+    1. **DMA_TO_DEVICE:** `copy_from_user` into the `cpu_addr` virtual memory, then use `dma_transfer` to move memory from RAM to the EDU device.
+    2. **DMA_FROM_DEVICE:** run `dma_transfer` from EDU to RAM, then `copy_to_user` from `cpu_addr`. This links the internal memory and lets us hand it back to the user.
+
+## No Intermediate Buffer Needed
+
+There is no need for an intermediate buffer. `cpu_addr` is a void pointer, and `dma_alloc_coherent` returned that void pointer as the virtual address. It also returns the physical address, stored through an argument pointer. So `cpu_addr` is a kernel virtual address pointing at 4KB of memory we already own. And the `from` in `copy_to_user` and the `to` in `copy_from_user` both take a void pointer, which is exactly what `cpu_addr` already is. So this is how the dots connect and the memory falls into place.
+
+So now I can say I understand the whole point of coherent DMA: it gives us two views of the same physical memory, in the form of `cpu_addr` (CPU's view) and `dma_handle` (device's view).
+
+## The arg Struct
+
+We need a struct for the arguments. Let's call it `dma_arg`. It holds the pointer to the payload buffer and the size being transported. This struct goes in the shared header file.
+
+### Growth Checkpoint: You Cannot Dereference arg Directly
+
+My first thought was to just do something like `arg->size` in the kernel. That's wrong.
+
+* `arg` is a userspace virtual address. The kernel cannot dereference it directly, because it has no guarantee of a valid mapping to physical memory and no guarantee it has permission to read or write there.
+* One thing to keep in mind: `arg` is literally just a raw number containing the memory address of the userspace struct.
+* The fix: create a local instance of the struct in the kernel, then use `copy_from_user` to copy the struct from userspace (`arg`) into that local instance. After that we can use the `.` operator on it normally.
+* I wrote rough code for this: made the struct in the header file, made a local instance, then copied from the userspace `arg` into the local struct before calling `dma_transfer`. That completes the cycle.
+
+### Growth Checkpoint: Working Out _IOR vs _IOW
+
+This one took several passes to get right, so here's the whole reasoning chain.
+
+* **Initial perception:** `EDU_DMA_FROM_DEVICE` should be `_IOR`, because it reads something from the EDU in order to transfer it to RAM. And `EDU_DMA_TO_DEVICE` should be `_IOW`, because we're writing what we have to the device.
+* **The problem with that:** these macros are completely blind to what the hardware is doing. They only care which direction the **arg struct itself** is moving. They say nothing about DMA direction and nothing about which way bytes move over the PCI bus. It is scoped to the ioctl argument entirely.
+* **Where the real distinction lives:** `_IOW` means userspace is writing and handing it to the kernel. `_IOR` means the kernel is writing back to userspace. `_IOWR` is both, where userspace and kernel read and write together.
+* **Applying it to my case:** the `arg` struct is on the user side. In both commands, userspace is the one filling out `arg` and handing it to the kernel. The userspace gives the data pointer and the size TO the kernel. Look at the algorithm: `copy_from_user` reads the arg struct once, reads its fields, and never writes back. The struct is pure input in both directions.
+* **Conclusion:** both commands are `_IOW`. It does not depend on the DMA transfer direction at all.
+* **When you would actually use `_IOWR`:** if the kernel updated a field in the arg struct at the end of the transfer and then used `copy_to_user` to send the struct back. The kernel updating the userspace side is what makes it read-write.
+
+**Final corrected reasoning:** the struct at `arg` is pure input in both commands. Userspace fills it in, the kernel reads it once and never writes back. The payload buffer is a separate allocation that `data_ptr` names, and the direction bits say nothing about it. So both commands are `_IOW`, regardless of which way the DMA runs.
+
+## ABI Compatibility: Struct Width Across the Boundary
+
+Just learned something new: the ABI (Application Binary Interface) compatibility issue.
+
+Both fields of our struct change width between a 32-bit userspace process and a 64-bit kernel. So the struct layout differs across the boundary, and `sizeof` picks that up. We do not want this, because the size is encoded into the ioctl command number itself, which means the kernel's switch statement would never match and would always error out.
+
+* **32-bit:** `size_t` is 4 bytes and `void*` is 4 bytes, so the struct is 8 bytes.
+* **64-bit:** `size_t` is 8 bytes and `void*` is 8 bytes, so the struct is 16 bytes.
+
+So we use fixed-width `__u64` types in the struct to stay perfectly sized across the boundary. Then inside the kernel we typecast `data_ptr` to an actual `void __user *`, and the size to an `unsigned long`.
+
+Ok so I just checked the 'z' char and it is being used for CAN bus card which would result in a conflict. We can use 'J'
+
 # Syntax Notes
 
 * A new return type I just learned about is `ssize_t`. This returns the amount of bytes that were read successfully.
