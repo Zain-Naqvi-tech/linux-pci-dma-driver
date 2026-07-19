@@ -24,20 +24,21 @@
 #include <linux/miscdevice.h> //used to create a misc device
 #include <linux/fs.h> //used for file operations struct
 #include <linux/dma-mapping.h> //used for DMA operations
+#include "edu_ioctl.h"
 
 MODULE_LICENSE("GPL"); 
 MODULE_AUTHOR("Zain");
 MODULE_DESCRIPTION("PCI Driver Work");
 MODULE_VERSION("1.0");
 
+//ioctl function: this is the function that is called when the user calls ioctl on the device file in the userspace program. It takes in the file pointer, the command, and the argument. The command is used to determine what operation to perform, and the argument is used to pass data to the driver
+static long edu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
+
 //irq_handler function: This is the ISR that is called when the device generates an interrupt
 static irqreturn_t irq_handler(int irq, void *dev_id);
 
 //read function: polls the EDU's status register to see if the first bit clears. Then, it reads the result in factorial computation register (0x08) 
 static ssize_t read_driver(struct file *filp, char __user *user_buf, size_t len, loff_t *offset);
-
-//DMA Transfer function: Moves memory
-static int dma_transfer(struct edu_device *edudev, size_t size, int direction);
 
 //write function: Write the input number to the factorial computation register (0x08). 
 static ssize_t write_driver(struct file *filp, const char __user *user_buf, size_t len, loff_t *offset);
@@ -67,6 +68,43 @@ static struct file_operations fops = {
     .unlocked_ioctl = edu_ioctl
 };
 
+//DMA Transfer function: Moves memory
+static int dma_transfer(struct edu_device *edudev, size_t size, int direction);
+
+//ioctl
+static long edu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
+
+    struct miscdevice *mdev = filp->private_data; //filp->private_data is a pointer to the miscdev field inside the edudev
+    struct edu_device *edudev = container_of(mdev, struct edu_device, miscdev);
+    
+    int result;
+    int copy_check;
+
+    struct edu_dma_arg local_arg; //local instance of the edu_dma_arg struct to hold the size and data pointer 
+    copy_check = copy_from_user(&local_arg, (void __user*)arg, sizeof(local_arg)); //copy the data from the user space buffer to the local arg struct. This is done before the DMA so that the args data can be easily accessed
+    if (copy_check) { return -EFAULT; } //return an error code to show that there were bytes which could not be successfully copied
+
+    switch (cmd) {
+    case EDU_DMA_TO_DEVICE:
+        
+        copy_check = copy_from_user(edudev->cpu_addr, (void __user *)local_arg.data_ptr, local_arg.size); //copy the data from the user space buffer to the DMA buffer. This is done before the DMA transfer is started so that the data is in the CPU address space and can be accessed by the device
+        if (copy_check) { return -EFAULT; } //return an error code to show that there were bytes which could not be successfully copied
+        result = dma_transfer(edudev, local_arg.size, 0); //dma_transfer function to transfer from RAM to the EDU device. Direction=0 to indicate that the direction is from RAM to EDU
+        return result; //return 0 on success or the error code on failure
+        
+    case EDU_DMA_FROM_DEVICE:
+
+        result = dma_transfer(edudev, local_arg.size, 1); //transfer from EDU to RAM using the transfer function. Direction is 1 for the opposite direction (EDU to RAM)
+        copy_check = copy_to_user((void __user *)local_arg.data_ptr, edudev->cpu_addr, local_arg.size); //copy the data from the DMA buffer to the user space buffer. This is done after the DMA transfer is complete and the data is in the CPU address space
+        if (copy_check) { return -EFAULT; } //return an error code to show that there were bytes which could not be successfully copied
+        return result; //return 0 on success or the error code on failure
+    
+    default:
+        return -ENOTTY; //return an error code that indicates that the command is not supported by the driver
+    }
+
+}
+
 //The ISR
 static irqreturn_t irq_handler(int irq, void *dev_id) {
     struct edu_device *edudev = dev_id; //get an edu_device instance using the dev_id being passed in
@@ -92,7 +130,12 @@ static int dma_transfer(struct edu_device *edudev, size_t size, int direction) {
     int dma_command_register = 0;
     int completion_result;
 
+    if (size > 4096) { //check if the size of the transfer is greater than the size of the allocated DMA buffer
+        return -EINVAL; //return an error code that indicates that the argument is invalid
+    }
+
     if (direction) { //EDU to RAM - Reading from the device
+        reinit_completion(&edudev->dma_work_done); //reinitialize the completion struct to reset the 'done' field to 0 and the waiting queue to empty
         iowrite32(0x40000, edudev->io_base + DMA_SOURCE_ADDRESS_REGISTER);
         iowrite32(edudev->dma_handle, edudev->io_base + DMA_DESTINATION_ADDRESS_REGISTER);
         iowrite32(size, edudev->io_base + DMA_TRANSFER_COUNT);
@@ -108,6 +151,7 @@ static int dma_transfer(struct edu_device *edudev, size_t size, int direction) {
     }
 
     else { //RAM to EDU - Writing to the device
+        reinit_completion(&edudev->dma_work_done); //reinitialize the completion struct to reset the 'done' field to 0 and the waiting queue to empty
         iowrite32(edudev->dma_handle, edudev->io_base + DMA_SOURCE_ADDRESS_REGISTER); //write the dma_handle to the Source address register
         iowrite32(0x40000, edudev->io_base + DMA_DESTINATION_ADDRESS_REGISTER); //write the 0x40000 address to DMA destination address register
         iowrite32(size, edudev->io_base + DMA_TRANSFER_COUNT); //write the size variable to the Transfer count register to determine the SIZE of the memory being transferred
