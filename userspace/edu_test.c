@@ -3,7 +3,11 @@
 #include <stdint.h> 
 #include <stdio.h> //used for printf()
 #include <errno.h> //used for error handling
-#include <string.h> //used for strerror()
+#include <string.h> //used for strerror() and memcmp()
+#include <sys/ioctl.h> //used for ioctl function
+#include <stdlib.h> //used for malloc() and free()
+
+#include "../src/edu_ioctl.h" //shared header file between the userspace and device file
 
 int ourFile;
 uint32_t inputNum;
@@ -22,8 +26,54 @@ int main() {
         return -1; 
     }
 
+    //IOCTL WORK
+    //fill in the userspace buffer with a known pattern
+    int *start_buffer = (int *)malloc(4096); //allocate the userspace buffer with a known pattern
+    if (start_buffer == NULL) {
+        printf("Malloc Failed!\n");
+    }
+    for (int i = 0; i < 5; i++) { //takes up 5*4 = 20 bytes of memory
+        start_buffer[i] = i; //expected to be [0,1,2,3,4]m
+    }
+
+    int *end_buffer = (int *)malloc(4096); //allocate the userspace buffer for the read-back 
+    if (end_buffer == NULL) {
+        printf("Malloc Failed!\n");
+    }
+
+    struct edu_dma_arg userspace_arg; 
+    userspace_arg.size = 20;
+    userspace_arg.data_ptr = (uint64_t)(unsigned long)start_buffer;
+
+    //ioctl for EDU_DMA_TO_DEVICE. userspace buffer -> CPU copies to DMA buffer (cpu_addr) -> Hardware reads from DMA buffer (dma_handle) an writes to the Device Buffer at 0x40000
+    int ioctl_result = ioctl(ourFile, EDU_DMA_TO_DEVICE, &userspace_arg); //use the ioctl function to kickstart the transfer TO the device FROM the userspace buffer
+    if (ioctl_result) {
+        printf("IOCTL (1) FAILED!\n");
+    }
+
+    userspace_arg.data_ptr = (uint64_t)(unsigned long)end_buffer; //now point the data pointer to the end_buffer. The buffer which will be filled in by the hardware based on what its buffer is filled with
+    //ioctl for EDU_DMA_FROM_DEVICE. Device buffer at 0x40000 -> hardware reads from itself anf writes to the DMA buffer (dma_handle) -> CPU reads from cpu_addr and copies it into the userspace buffer end_buffer
+    ioctl_result = ioctl(ourFile, EDU_DMA_FROM_DEVICE, &userspace_arg);
+    if (ioctl_result) {
+        printf("IOCTL (2) FAILED!\n");
+    }
+
+    int final_result = memcmp(start_buffer, end_buffer, userspace_arg.size);
+
+    if (final_result == 0) {
+        printf("DMA Transfer Successful!\n");
+    }
+    else {
+        printf("DMA Transfer Failed!\n");
+    }
+
+    free(start_buffer);
+    free(end_buffer);
+
+    //IOCTL WORK
+
     //WRITE: successfully opened the file. Now, we write to it
-    //successWrite = write(ourFile, &inputNum, sizeof(inputNum)); //Writes the inputNum to the file. Returns the number of bytes written successfully 
+    successWrite = write(ourFile, &inputNum, sizeof(inputNum)); //Writes the inputNum to the file. Returns the number of bytes written successfully 
     if (successWrite == -1) { //failed to write to the file
 
         printf("Driver write failed with error code: %s\n", strerror(errno));
