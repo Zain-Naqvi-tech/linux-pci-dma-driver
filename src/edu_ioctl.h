@@ -2,6 +2,7 @@
 #define EDU_IOCTL_H
 
 #include <linux/ioctl.h> //used for ioctl macros
+#include <linux/types.h> //used for __u64 type
 
 struct edu_dma_arg {
     __u64 size; //size of the transfer

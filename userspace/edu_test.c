@@ -10,7 +10,7 @@
 #include "../src/edu_ioctl.h" //shared header file between the userspace and device file
 
 int main() {
-    
+
     int ourFile;
     uint32_t inputNum;
     uint32_t outputNum;
@@ -23,6 +23,7 @@ int main() {
     ourFile = open("/dev/edu", O_RDWR); //open function takes in the file address and the read/write access from the file
 
     if (ourFile == -1) { //failed to open file
+        printf("Failed to open the device file\n");
         return -1; 
     }
 
@@ -42,6 +43,8 @@ int main() {
         printf("Malloc Failed!\n");
         return -1;
     }
+
+    memset(end_buffer, 0xAA, 4096); //fill the end_buffer with 0xAA to have a recognizable pattern for debugging during read-back
 
     struct edu_dma_arg userspace_arg; 
     userspace_arg.size = 20;
