@@ -98,6 +98,8 @@ static long edu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         
     case EDU_DMA_FROM_DEVICE:
 
+        memset(edudev->cpu_addr, 0xFF, sizeof(edudev->cpu_addr)); //fill the DMA buffer with 0xFF to ensure that the data is being read from the EDU device and not from the CPU address space. This is done before the DMA transfer is started so that the data is in the CPU address space and can be accessed by the device
+
         result = dma_transfer(edudev, local_arg.size, 1); //transfer from EDU to RAM using the transfer function. Direction is 1 for the opposite direction (EDU to RAM)
         if (result) { return result; } //return the error code if the DMA transfer failed (non-zero return)
         copy_check = copy_to_user((void __user *)(unsigned long)local_arg.data_ptr, edudev->cpu_addr, local_arg.size); //copy the data from the DMA buffer to the user space buffer. This is done after the DMA transfer is complete and the data is in the CPU address space
