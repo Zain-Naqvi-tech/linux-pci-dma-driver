@@ -9,6 +9,8 @@
 
 #include "../src/edu_ioctl.h" //shared header file between the userspace and device file
 
+#define DMA_BUFFER_SIZE 4096 //size of the DMA buffer
+
 int main() {
 
     int ourFile;
@@ -29,7 +31,7 @@ int main() {
 
     //IOCTL WORK
     //fill in the userspace buffer with a known pattern
-    int *start_buffer = (int *)malloc(4096); //allocate the userspace buffer with a known pattern
+    int *start_buffer = (int *)malloc(DMA_BUFFER_SIZE); //allocate the userspace buffer with a known pattern
     if (start_buffer == NULL) {
         printf("Malloc Failed!\n");
         return -1;
@@ -38,13 +40,13 @@ int main() {
         start_buffer[i] = i; //expected to be [0,1,2,3,4]m
     }
 
-    int *end_buffer = (int *)malloc(4096); //allocate the userspace buffer for the read-back 
+    int *end_buffer = (int *)malloc(DMA_BUFFER_SIZE); //allocate the userspace buffer for the read-back 
     if (end_buffer == NULL) {
         printf("Malloc Failed!\n");
         return -1;
     }
 
-    memset(end_buffer, 0xAA, 4096); //fill the end_buffer with 0xAA to have a recognizable pattern for debugging during read-back
+    memset(end_buffer, 0xAA, DMA_BUFFER_SIZE); //fill the end_buffer with 0xAA to have a recognizable pattern for debugging during read-back
 
     struct edu_dma_arg userspace_arg; 
     userspace_arg.size = 20;

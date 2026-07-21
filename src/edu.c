@@ -18,6 +18,8 @@
 #define DMA_TRANSFER_COUNT 0x90 //the size of the area to perform the DMA on
 #define DMA_COMMAND_REGISTER 0x98 //Bitwise OR of 0x01, 0x02, and 0x04 to start, fill the direction, and raise interrupt respectively
 
+#define DMA_BUFFER_SIZE 4096 //size of the DMA buffer
+
 #include <linux/module.h> //all kernel modules
 #include <linux/pci.h> //used to interact with PCI drivers and devices
 #include <linux/init.h> //__init and __exit macros 
@@ -84,7 +86,7 @@ static long edu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
     copy_check = copy_from_user(&local_arg, (void __user*)arg, sizeof(local_arg)); //copy the data from the user space buffer to the local arg struct. This is done before the DMA so that the args data can be easily accessed
     if (copy_check) { return -EFAULT; } //return an error code to show that there were bytes which could not be successfully copied
 
-    if (local_arg.size > 4096) { //check if the size of the transfer is greater than the size of the allocated DMA buffer
+    if (local_arg.size > DMA_BUFFER_SIZE) { //check if the size of the transfer is greater than the size of the allocated DMA buffer
         return -EINVAL; //return an error code that indicates that the argument is invalid
     }
 
@@ -98,7 +100,7 @@ static long edu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         
     case EDU_DMA_FROM_DEVICE:
 
-        memset(edudev->cpu_addr, 0xFF, 4096); //fill the DMA buffer with 0xFF to ensure that the data is being read from the EDU device and not from the CPU address space. This is done before the DMA transfer is started so that the data is in the CPU address space and can be accessed by the device
+        memset(edudev->cpu_addr, 0xFF, DMA_BUFFER_SIZE); //fill the DMA buffer with 0xFF to ensure that the data is being read from the EDU device and not from the CPU address space. This is done before the DMA transfer is started so that the data is in the CPU address space and can be accessed by the device
 
         result = dma_transfer(edudev, local_arg.size, 1); //transfer from EDU to RAM using the transfer function. Direction is 1 for the opposite direction (EDU to RAM)
         if (result) { return result; } //return the error code if the DMA transfer failed (non-zero return)
@@ -137,7 +139,7 @@ static int dma_transfer(struct edu_device *edudev, size_t size, int direction) {
     int dma_command_register = 0;
     int completion_result;
 
-    if (size > 4096) { //check if the size of the transfer is greater than the size of the allocated DMA buffer
+    if (size > DMA_BUFFER_SIZE) { //check if the size of the transfer is greater than the size of the allocated DMA buffer
         return -EINVAL; //return an error code that indicates that the argument is invalid
     }
 
@@ -297,7 +299,7 @@ static int probe(struct pci_dev* pcidev, const struct pci_device_id* id) {
     }
 
     //allocate RAM for the region
-    edudev->cpu_addr = dma_alloc_coherent(&pcidev->dev, 4096, &edudev->dma_handle, GFP_KERNEL); //allocate 4KB of coherent memory. It returns the virtual address which you can use to access it from the CPU and the dma_handle (changed by pass-by-reference) which is the physicall address that the device can use
+    edudev->cpu_addr = dma_alloc_coherent(&pcidev->dev, DMA_BUFFER_SIZE &edudev->dma_handle, GFP_KERNEL); //allocate 4KB of coherent memory. It returns the virtual address which you can use to access it from the CPU and the dma_handle (changed by pass-by-reference) which is the physicall address that the device can use
 
     if (!(edudev->cpu_addr)) { //if NULL
         dev_err(&pcidev->dev, "Failed to allocate DMA buffer\n");
@@ -326,7 +328,7 @@ static int probe(struct pci_dev* pcidev, const struct pci_device_id* id) {
     return 0;
 
 err_misc_register:
-    dma_free_coherent(&pcidev->dev, 4096, edudev->cpu_addr, edudev->dma_handle); //free the allocated RAM for the DMA region
+    dma_free_coherent(&pcidev->dev, DMA_BUFFER_SIZE, edudev->cpu_addr, edudev->dma_handle); //free the allocated RAM for the DMA region
 err_dma_mask:
     free_irq(edudev->vector, edudev); //free the allocated vector
 err_irq_request:
@@ -347,7 +349,7 @@ static void remove(struct pci_dev* pcidev){
     misc_deregister(&edudev->miscdev); //deregister the misc device inside the edudev
     
     //We unwind in the opposite order of the probe function
-    dma_free_coherent(&pcidev->dev, 4096, edudev->cpu_addr, edudev->dma_handle); //free the allocated RAM for the DMA region
+    dma_free_coherent(&pcidev->dev, DMA_BUFFER_SIZE, edudev->cpu_addr, edudev->dma_handle); //free the allocated RAM for the DMA region
     free_irq(edudev->vector, edudev); //free the allocated vector
     pci_free_irq_vectors(pcidev);
     iounmap(edudev->io_base); //unmap the BAR0 region from virtual Kernel Space

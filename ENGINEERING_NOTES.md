@@ -663,6 +663,77 @@ So we use fixed-width `__u64` types in the struct to stay perfectly sized across
 
 Ok so I just checked the 'z' char and it is being used for CAN bus card which would result in a conflict. We can use 'J'
 
+---
+
+# Userspace DMA Test App
+
+## First Draft of the Flow
+
+* Open the file.
+* Fill in our struct.
+* Call the ioctl function to send the buffer info and the setup command to the kernel.
+* But we also need to allocate a buffer. I researched different ways like `mmap`, `aligned_alloc`, and `alloca`. The malloc family (`malloc()`, `realloc()`, `calloc()`) seems like the best option here.
+* So our main goal is to GET the data we need to move, which is why we built the system in the first place. The `ioctl` call we make is linked to fops, which is linked to my `edu_ioctl` function, which calls `dma_transfer`.
+
+On a more "codey" note:
+* `int ioctl(int fd, unsigned long request, pointer to a struct both sides agree on)`. `fd` is the file, that's straightforward. `request` is the macros we defined in the header file for direction.
+* Say I allocated a buffer using `malloc`. Then I want to use `ioctl` in userspace to send that buffer in the appropriate direction. Which parameter carries it? It should be the pointer to the struct. In my case that's the `dma_arg` struct, which holds a pointer to the data and a size. So I fill that in using the buffer and size myself, then call `ioctl`.
+
+## Fixes in My Understanding
+
+* `cpu_addr` IS the RAM. It is a kernel-side host memory allocation.
+* The path is `cpu_addr` to device buffer, then device buffer back to `cpu_addr`.
+* The problem: if the DMA fails without telling the kernel, we end up with the same starting value still sitting in `cpu_addr`. That would read as a pass when nothing actually moved. A false positive.
+* So we need to wipe `cpu_addr` in between the two DMA operations. An option is `memset`, which is something new I'd be learning.
+* `memset` is a built-in C function used to fill a specified block of memory with a particular byte value. It is commonly used to quickly initialize arrays to zero or clear data.
+* `void *memset(void *ptr, int value, size_t num);`
+    * `ptr` is a pointer to the starting memory address of the block to fill.
+    * `value` is the value to be set, and it can be an unsigned char as well.
+    * `num` is the number of bytes to be set to that value.
+* We overwrite the destination with known garbage or all zeros so we know if the transfer didn't happen. This happens right before we call `EDU_DMA_FROM_DEVICE`.
+
+## Final Flow
+
+1. Open the file with `O_RDWR`.
+2. Use `malloc` to allocate a 4KB source buffer and fill it with a known value.
+3. Allocate another 4KB with `malloc` for the read-back.
+4. Fill in the struct.
+5. Call `ioctl`. This is where the driver copies the pattern into `cpu_addr` and DMAs it from there into the device's internal buffer at 0x40000.
+6. Change the struct values to point at the destination buffer and call `ioctl` again.
+7. `memcmp` the two buffers over the full transfer length.
+
+## Clarifications While Writing the Code
+
+The DMA buffer is both `cpu_addr` and `dma_handle`. Two names for the same physical memory:
+* When the CPU looks at that RAM, it calls it `cpu_addr`.
+* When the device hardware looks at that RAM, it calls it `dma_handle`.
+* The **device buffer** is separate. That's the memory hardcoded into QEMU at 0x40000, inside the EDU device itself.
+
+**Forward (RAM to EDU, DMA to device):**
+Userspace buffer -> CPU copies into the DMA buffer (`cpu_addr`) -> hardware reads from `dma_handle` and writes to the device buffer at 0x40000.
+
+**Reverse (EDU to RAM, DMA from device):**
+Device buffer at 0x40000 -> hardware reads from itself and writes to the DMA buffer (`dma_handle` now) -> CPU reads from `cpu_addr` and copies it out to the userspace buffer.
+
+## Notes While Coding
+
+* Learned about `memset` and `memcmp`.
+* Forgot `strerror(errno)`, so I added those in along with terminating -1 returns.
+* Everything else was pretty simple.
+
+Running it:
+* `make`, then `insmod` and `dmesg` to confirm the allocations.
+* `cd` into `userspace`, then `gcc -Wall -Wextra -o edu_test edu_test.c`.
+* Run it: `sudo ./edu_test`
+* `sudo dmesg | tail -20`
+
+**IT WORKS.**
+
+## Bugs and Tests
+
+* **`memset` sizing mistake:** I passed `sizeof()` on the pointer instead of the buffer length. On a 64-bit build that clears only the first 8 bytes, not the full 4096. The test still reported a match, but that's because `memcmp` compared buffers that were both correct anyway, not because the wipe did its job. The wipe was almost entirely ineffective, so it was not actually protecting against the false positive it exists to catch. Fix the length and re-run before trusting the result.
+* **Oversize test:** I deliberately passed a size larger than the buffer, and it returned `-EINVAL` as it should. Validation path confirmed.
+
 # Syntax Notes
 
 * A new return type I just learned about is `ssize_t`. This returns the amount of bytes that were read successfully.
