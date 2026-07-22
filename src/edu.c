@@ -19,6 +19,9 @@
 #define DMA_COMMAND_REGISTER 0x98 //Bitwise OR of 0x01, 0x02, and 0x04 to start, fill the direction, and raise interrupt respectively
 
 #define DMA_BUFFER_SIZE 4096 //size of the DMA buffer
+#define DEVICE_MEM_OFFSET 0x40000
+
+#define PIO_TEST_REGISTER 0x04
 
 #include <linux/module.h> //all kernel modules
 #include <linux/pci.h> //used to interact with PCI drivers and devices
@@ -73,6 +76,9 @@ static struct file_operations fops = {
 //DMA Transfer function: Moves memory
 static int dma_transfer(struct edu_device *edudev, size_t size, int direction);
 
+//PIO Transfer function: Moves memory using a loop rather than using hardware DMA. 
+static int PIO_transfer(struct edu_device *edudev, size_t size, int direction, u64 *delta);
+
 //ioctl
 static long edu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 
@@ -114,6 +120,38 @@ static long edu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 
 }
 
+//PIO
+static int PIO_transfer(struct edu_device *edudev, size_t size, int direction, u64 *delta) {
+
+    u32 read_result;
+
+    //timer declarations
+    u64 start;
+    u64 end; 
+
+    //start timer
+    start = ktime_get_ns(); //starting time
+
+    for (int i = 0; i < size; i+=4) {
+        if (direction) { //EDU to RAM. 0x40000 to cpu_addr
+            read_result = ioread32(edudev->io_base + PIO_TEST_REGISTER); //read the result from 0x04
+            *(u32 *)((char*)edudev->cpu_addr + i) = read_result; //this dereferences the address location and stotes the read_result from 0x40000
+        }
+        else { //RAM to EDU. cpu_addr to 0x40000
+            read_result = *(u32 *)((char*)edudev->cpu_addr + i); //read the result from dereferencing cpu_addr + i
+            iowrite32(read_result, edudev->io_base + PIO_TEST_REGISTER); //write the result to the device offset value
+        }
+    }
+
+    //end timer
+    end = ktime_get_ns(); //ending time
+
+
+
+    return 0; //success
+
+}
+
 //The ISR
 static irqreturn_t irq_handler(int irq, void *dev_id) {
     struct edu_device *edudev = dev_id; //get an edu_device instance using the dev_id being passed in
@@ -145,7 +183,7 @@ static int dma_transfer(struct edu_device *edudev, size_t size, int direction) {
 
     if (direction) { //EDU to RAM - Reading from the device
         reinit_completion(&edudev->dma_work_done); //reinitialize the completion struct to reset the 'done' field to 0 and the waiting queue to empty
-        iowrite32(0x40000, edudev->io_base + DMA_SOURCE_ADDRESS_REGISTER);
+        iowrite32(DEVICE_MEM_OFFSET, edudev->io_base + DMA_SOURCE_ADDRESS_REGISTER);
         iowrite32(edudev->dma_handle, edudev->io_base + DMA_DESTINATION_ADDRESS_REGISTER);
         iowrite32(size, edudev->io_base + DMA_TRANSFER_COUNT);
         dma_command_register = (0x01 | 0x02 | 0x04); //start transfer, EDU to RAM (direction is 1), raise interrupt after finishing
@@ -162,7 +200,7 @@ static int dma_transfer(struct edu_device *edudev, size_t size, int direction) {
     else { //RAM to EDU - Writing to the device
         reinit_completion(&edudev->dma_work_done); //reinitialize the completion struct to reset the 'done' field to 0 and the waiting queue to empty
         iowrite32(edudev->dma_handle, edudev->io_base + DMA_SOURCE_ADDRESS_REGISTER); //write the dma_handle to the Source address register
-        iowrite32(0x40000, edudev->io_base + DMA_DESTINATION_ADDRESS_REGISTER); //write the 0x40000 address to DMA destination address register
+        iowrite32(DEVICE_MEM_OFFSET, edudev->io_base + DMA_DESTINATION_ADDRESS_REGISTER); //write the 0x40000 address to DMA destination address register
         iowrite32(size, edudev->io_base + DMA_TRANSFER_COUNT); //write the size variable to the Transfer count register to determine the SIZE of the memory being transferred
         dma_command_register = (0x01 | 0x00 | 0x04); //Start transfer, RAM to edu (direction is 0), raise interrupt after finishing 
         iowrite32(dma_command_register, edudev->io_base + DMA_COMMAND_REGISTER); //write the command to the command register to start the transfer
@@ -299,7 +337,7 @@ static int probe(struct pci_dev* pcidev, const struct pci_device_id* id) {
     }
 
     //allocate RAM for the region
-    edudev->cpu_addr = dma_alloc_coherent(&pcidev->dev, DMA_BUFFER_SIZE &edudev->dma_handle, GFP_KERNEL); //allocate 4KB of coherent memory. It returns the virtual address which you can use to access it from the CPU and the dma_handle (changed by pass-by-reference) which is the physicall address that the device can use
+    edudev->cpu_addr = dma_alloc_coherent(&pcidev->dev, DMA_BUFFER_SIZE, &edudev->dma_handle, GFP_KERNEL); //allocate 4KB of coherent memory. It returns the virtual address which you can use to access it from the CPU and the dma_handle (changed by pass-by-reference) which is the physicall address that the device can use
 
     if (!(edudev->cpu_addr)) { //if NULL
         dev_err(&pcidev->dev, "Failed to allocate DMA buffer\n");
