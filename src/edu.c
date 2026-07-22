@@ -115,6 +115,7 @@ static long edu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         return result; //return 0 on success or the error code on failure
     
     case EDU_PIO_TO_DEVICE:
+        copy_check = copy_from_user(edudev->cpu_addr, (void __user *)(unsigned long)local_arg.data_ptr, local_arg.size); //copy the data from the user space buffer to the DMA buffer
 
     case EDU_PIO_FROM_DEVICE:
 
@@ -137,11 +138,11 @@ static int PIO_transfer(struct edu_device *edudev, size_t size, int direction, u
     start = ktime_get_ns(); //starting time
 
     for (int i = 0; i < size; i+=4) {
-        if (direction) { //EDU to RAM. 0x40000 to cpu_addr
+        if (direction) { //EDU to RAM. 0x04 to cpu_addr
             read_result = ioread32(edudev->io_base + PIO_TEST_REGISTER); //read the result from 0x04
             *(u32 *)((char*)edudev->cpu_addr + i) = read_result; //this dereferences the address location and stotes the read_result from 0x40000
         }
-        else { //RAM to EDU. cpu_addr to 0x40000
+        else { //RAM to EDU. cpu_addr to 0x04
             read_result = *(u32 *)((char*)edudev->cpu_addr + i); //read the result from dereferencing cpu_addr + i
             iowrite32(read_result, edudev->io_base + PIO_TEST_REGISTER); //write the result to the device offset value
         }
