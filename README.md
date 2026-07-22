@@ -151,3 +151,78 @@ sudo od -An -tu4 /dev/edu
 # Count is now 1: the result came via a real interrupt, not the old busy-poll
 cat /proc/interrupts | grep edu
 ```
+
+## ioctl Interface and DMA
+
+The driver exposes DMA transfers through `ioctl` on `/dev/edu`, alongside the
+existing `read`/`write` factorial path.
+
+### Shared ABI header
+
+`edu_ioctl.h` is compiled by both the driver and userspace, so the command
+numbers and argument layout can never drift apart. Commands are built with the
+`_IOWR` macros, which pack a magic letter, a sequence number, the direction
+bits, and `sizeof(struct edu_dma_arg)` into a single 32-bit value.
+
+The argument struct uses fixed-width `__u64` fields for size, user buffer
+address, and elapsed time. Fixed-width types matter here: `size_t` and `void *`
+change size between a 32-bit userspace process and a 64-bit kernel, which would
+change the struct layout and the encoded `sizeof`, breaking the ABI silently.
+The user pointer is carried as a `__u64` and cast to `void __user *` on the
+kernel side.
+
+The direction bits describe the argument struct, not the DMA. Both transfer
+commands are `_IOWR` because userspace fills the struct in and the kernel writes
+the measured elapsed time back into it. The payload buffer that `data_ptr` names
+is a separate allocation and does not affect the macro choice.
+
+### Transfer path
+
+Two boundaries are crossed on every transfer, not one:
+
+- `copy_from_user` / `copy_to_user` moves data between the userspace buffer and
+  the driver's DMA buffer
+- the DMA engine moves data between that buffer and the device's internal 4 KB
+  buffer at offset `0x40000`
+
+Order matters. Writing to the device copies from userspace first, then starts
+the DMA. Reading from the device runs the DMA first, then copies out, and only
+if the transfer actually succeeded.
+
+The DMA buffer comes from `dma_alloc_coherent`, which returns two views of the
+same memory: a kernel virtual address for the CPU and a bus address for the
+device. Coherent mapping means no explicit cache synchronisation is needed
+between the two. A 28-bit DMA mask is set before allocation, as the EDU device
+supports only 28-bit addressing by default. That mask is also what makes it
+safe to program the bus address with a 32-bit `iowrite32`.
+
+This is a copy-based DMA design rather than zero-copy. The user's buffer is
+never touched by the device, so its alignment and physical layout are
+irrelevant, and no page pinning is required. The cost is one extra copy per
+transfer, which shows up in the benchmark.
+
+### Validation
+
+The transfer size is validated in the ioctl handler, immediately after the
+argument struct is unpacked and before any copy runs. Validating at the trust
+boundary rather than at the point of use matters here: the size reaches
+`copy_from_user` before it ever reaches the DMA engine, so a check further down
+would fire only after 4 KB of kernel heap had already been overrun. The bound is
+also enforced inside the transfer function as defence in depth.
+
+### Verifying the transfer is real
+
+A naive round-trip test writes a pattern to the device, reads it back, and
+compares. That test passes even when the DMA does nothing, because the driver's
+buffer still holds the pattern from the outbound copy. The read path therefore
+fills the buffer with a known poison value before starting the inbound transfer,
+so anything read back is provably new data from the device.
+
+Confirmed working: 20-byte round trip returns the original pattern, an
+oversized request returns `EINVAL` without touching the buffer, and the
+factorial `read`/`write` path is unaffected.
+
+### In progress
+
+A programmed I/O path and a latency and throughput benchmark comparing PIO,
+interrupt-driven, and DMA transfers across a range of sizes.

@@ -114,6 +114,10 @@ static long edu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         if (copy_check) { return -EFAULT; } //return an error code to show that there were bytes which could not be successfully copied
         return result; //return 0 on success or the error code on failure
     
+    case EDU_PIO_TO_DEVICE:
+
+    case EDU_PIO_FROM_DEVICE:
+
     default:
         return -ENOTTY; //return an error code that indicates that the command is not supported by the driver
     }
@@ -146,9 +150,9 @@ static int PIO_transfer(struct edu_device *edudev, size_t size, int direction, u
     //end timer
     end = ktime_get_ns(); //ending time
 
+    *delta = (end - start); //dereference delta and put in the delta value into it for it to be used later
 
-
-    return 0; //success
+    return 0; 
 
 }
 
