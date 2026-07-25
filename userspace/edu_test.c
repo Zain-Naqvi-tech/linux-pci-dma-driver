@@ -18,6 +18,9 @@ int main() {
     uint32_t outputNum;
     ssize_t successWrite;
     ssize_t successRead;
+    int ioctl_result;
+
+    struct edu_dma_arg userspace_arg;
 
     inputNum = 5;
 
@@ -29,7 +32,56 @@ int main() {
         return -1; 
     }
 
-    //IOCTL WORK
+    //PIO IOCTL WORK
+    //we need to send in a number from the userspace
+
+    int *pio_input = (int *)malloc(DMA_BUFFER_SIZE); //allocating 4KB of memory
+    if (pio_input == NULL) {
+        printf("Malloc Failed!\n");
+        return -1;
+    }
+
+    int *pio_result = (int *)malloc(DMA_BUFFER_SIZE);
+    if (pio_result == NULL) {
+        printf("Malloc Failed\n");
+        return -1; 
+    }
+
+    pio_input[0] = 5; //this is the value which will be read by the inversion register on the edu side of the system
+    pio_result[0] = 8; //this is the predetermined value of pio_result for debugging in case everything goes smoothly but the result is not what we expected
+
+    userspace_arg.size = 4; //enough for one word (number 5 and number 8)
+    userspace_arg.data_ptr = (uint64_t)(unsigned long)pio_input;
+
+    ioctl_result = ioctl(ourFile, EDU_PIO_TO_DEVICE, &userspace_arg);
+    if (ioctl_result) {
+        printf("PIO IOCTL (1) FAILED with error code: %s\n", strerror(errno));
+        return -1;
+    }
+
+    printf("PIO Time Taken TO device: %llu\n", userspace_arg.delta);
+
+    userspace_arg.data_ptr = (uint64_t)(unsigned long)pio_result;
+
+    ioctl_result = ioctl(ourFile, EDU_PIO_FROM_DEVICE, &userspace_arg);
+    if (ioctl_result) {
+        printf("PIO IOCTL (2) FAILED with error code: %s\n", strerror(errno));
+        return -1; 
+    }
+
+    printf("PIO Time Taken FROM device: %llu\n", userspace_arg.delta);
+
+    if (pio_result[0] == ~pio_input[0]) {
+        printf("PIO Transfer Successful\n");
+    }
+    else {
+        printf("PIO Transfer Has Failed :(\n");
+    }
+
+    free(pio_input);
+    free(pio_result);
+
+    //DMA IOCTL WORK
     //fill in the userspace buffer with a known pattern
     int *start_buffer = (int *)malloc(DMA_BUFFER_SIZE); //allocate the userspace buffer with a known pattern
     if (start_buffer == NULL) {
@@ -47,17 +99,18 @@ int main() {
     }
 
     memset(end_buffer, 0xAA, DMA_BUFFER_SIZE); //fill the end_buffer with 0xAA to have a recognizable pattern for debugging during read-back
-
-    struct edu_dma_arg userspace_arg; 
+ 
     userspace_arg.size = 20;
     userspace_arg.data_ptr = (uint64_t)(unsigned long)start_buffer;
 
     //ioctl for EDU_DMA_TO_DEVICE. userspace buffer -> CPU copies to DMA buffer (cpu_addr) -> Hardware reads from DMA buffer (dma_handle) and writes to the Device Buffer at 0x40000
-    int ioctl_result = ioctl(ourFile, EDU_DMA_TO_DEVICE, &userspace_arg); //use the ioctl function to kickstart the transfer TO the device FROM the userspace buffer
+    ioctl_result = ioctl(ourFile, EDU_DMA_TO_DEVICE, &userspace_arg); //use the ioctl function to kickstart the transfer TO the device FROM the userspace buffer
     if (ioctl_result) {
         printf("IOCTL (1) FAILED with error code: %s\n", strerror(errno));
         return -1;
     }
+
+    printf("DMA Time Taken TO device: %llu\n", userspace_arg.delta);
 
     userspace_arg.data_ptr = (uint64_t)(unsigned long)end_buffer; //now point the data pointer to the end_buffer. The buffer which will be filled in by the hardware based on what its buffer is filled with
     //ioctl for EDU_DMA_FROM_DEVICE. Device buffer at 0x40000 -> hardware reads from itself anf writes to the DMA buffer (dma_handle) -> CPU reads from cpu_addr and copies it into the userspace buffer end_buffer
@@ -66,6 +119,8 @@ int main() {
         printf("IOCTL (2) FAILED with error code: %s\n", strerror(errno));
         return -1;
     }
+
+    printf("DMA Time Taken FROM device: %llu\n", userspace_arg.delta);
 
     int final_result = memcmp(start_buffer, end_buffer, userspace_arg.size);
 
@@ -78,8 +133,6 @@ int main() {
 
     free(start_buffer);
     free(end_buffer);
-
-    //IOCTL WORK
 
     //WRITE: successfully opened the file. Now, we write to it
     successWrite = write(ourFile, &inputNum, sizeof(inputNum)); //Writes the inputNum to the file. Returns the number of bytes written successfully 
@@ -98,7 +151,7 @@ int main() {
         return -1;
 
     }
-    printf("The output from the driver is %d\n", outputNum);
+    printf("The output from the driver is %u\n", outputNum);
 
     close(ourFile); //close the file
     return 0;
