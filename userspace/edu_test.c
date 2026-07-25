@@ -6,6 +6,7 @@
 #include <string.h> //used for strerror() and memcmp()
 #include <sys/ioctl.h> //used for ioctl function
 #include <stdlib.h> //used for malloc() and free()
+#include <math.h>
 
 #include "../src/edu_ioctl.h" //shared header file between the userspace and device file
 
@@ -53,7 +54,7 @@ int main() {
     //Loop Starts
 
     for (size_t i = 2; i <= 12; i++) { //loop for all sizes - 2^2 (4) to 2^12 (4096)
-        userspace_arg.size = 2^i; //enough for one word (number 5 and number 8)
+        userspace_arg.size = pow(2,i);; //enough for one word (number 5 and number 8)
         userspace_arg.data_ptr = (uint64_t)(unsigned long)pio_input;
 
         ioctl_result = ioctl(ourFile, EDU_PIO_TO_DEVICE, &userspace_arg);
