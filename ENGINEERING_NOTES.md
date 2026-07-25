@@ -734,6 +734,130 @@ Running it:
 * **`memset` sizing mistake:** I passed `sizeof()` on the pointer instead of the buffer length. On a 64-bit build that clears only the first 8 bytes, not the full 4096. The test still reported a match, but that's because `memcmp` compared buffers that were both correct anyway, not because the wipe did its job. The wipe was almost entirely ineffective, so it was not actually protecting against the false positive it exists to catch. Fix the length and re-run before trusting the result.
 * **Oversize test:** I deliberately passed a size larger than the buffer, and it returned `-EINVAL` as it should. Validation path confirmed.
 
+---
+
+# Phase 4: Benchmark
+
+## Goal
+
+Measure and plot three transfer paths moving data between host memory and the device's 4KB buffer:
+* Programmed I/O (our hardcoded read/write)
+* Interrupt-driven (the MSI interrupt based reading)
+* DMA
+
+All across different sizes. Interrupt latency is also something to be measured.
+
+This shows why these three different ways exist and improves my understanding of their efficiencies and differences. After writing the flow for the code, I'll do more research on the differences in timing and efficiency in THEORY, then compare against my actual results.
+
+Main comparisons:
+* Interrupts on their own compared to polling
+* DMA vs PIO
+
+## Theory
+
+### Programmed I/O
+* Only the CPU works here. It reads a 32-bit chunk from system RAM and writes it to device memory using a for loop and `iowrite32`.
+* Setup overhead: zero per word. Calculate a pointer offset and start writing.
+* CPU time: 100 percent utilization. The CPU is entirely blocked doing the writing.
+* Efficiency: very good for small transfers.
+* PIO is the fastest way to get a few bytes across the bus. It has no setup time.
+* Con: it takes up CPU time, so performance dies as the size increases. A good relationship to keep an eye on.
+
+### Direct Memory Access (DMA)
+* The CPU only manages the transfer. It sets the source, destination, and size like in our implementation, hands it to the DMA controller, then works on other stuff. So it isn't fully consumed by the transfer.
+* Setup overhead: very high.
+* CPU time: near 0 percent during the actual transfer. The CPU only spends time on setup and on handling the completion interrupt at the end.
+* Efficiency: bad for small transfers, very good for bulk transfers.
+* Example: to transfer 4 bytes, the DMA setup would take longer than just moving those 4 bytes with PIO. Another interesting relationship.
+
+### Interrupt-Driven I/O
+* Instead of polling, the CPU goes to sleep and the hardware fires an IRQ to wake it up when a condition is met (our first read/write approach).
+* Setup overhead: heavy. When an interrupt fires, the CPU stops the current program, saves registers, switches to a kernel interrupt context, executes the ISR, then restores the original program.
+* CPU time: frees the CPU while waiting, but burns cycles on the context switch.
+* Efficiency: suited to unpredictable events. Also used inside DMA (the completion signal).
+* I'm going to measure the delay/latency that interrupts bring in my driver.
+
+## PIO Implementation
+
+General notes:
+* It needs one extra ioctl command in the userspace file.
+* It's a for loop. 32 bits is 4 bytes per transfer, so for a 4-byte transfer the loop runs once and moves data from A to B.
+* During the benchmark we increase the size gradually to see where performance starts dipping, so we get a feel for the size constraints. These sizes are powers of 2: 4, 8, 16, 32, 64, and up.
+* The PIO path must take data through the kernel's `cpu_addr` before the hardware transfer. This way PIO and DMA have an identical setup cost, so we only measure the transfer time itself.
+* For timing, we use both userspace and kernel-side timing, whichever answers the comparisons above. I need to see how much overhead each path takes, since I theorized DMA has more. I also want CPU time for both, since I theorized about that too.
+* For interrupt latency, we measure from the triggering of the interrupt to the first line in the ISR. We reuse the same `copy_to_user` pipeline to hand it out to userspace.
+
+### Timing Strategy
+* Two things for PIO and DMA. One, the TOTAL time using `clock_gettime()` in userspace right before and after the ioctl. This is the full start-to-finish time. Two, `ktime_get_ns()` inside the kernel, which captures only the kernel-side portion including the hardware transfer. It misses the userspace-to-kernel crossing and the `copy_from_user` jump.
+* Implement a PIO function in the kernel, linked through the ioctl.
+
+### Where the Timestamps Live
+* For DMA and PIO, the timestamps are local to their function. We `copy_to_user` both deltas back, so locality is fine.
+* For interrupt latency, the delta needs wider scope. Per-device is the right call, so it goes in the `edu_device` struct. Once the delta is computed we `copy_to_user` it. The interrupt is triggered in the write function and then goes into the ISR, and both the ISR and write have access to the same `edudev` struct. That's ideal, and it also keeps devices separate if we ever have more than one.
+* CSV part comes after the timestamp and PIO work is done.
+
+### Address Reference (swapped this too many times, so definitive note)
+* `cpu_addr` and `dma_handle` are SYSTEM RAM (two views of the same buffer).
+* `data_ptr` is userspace RAM, `cpu_addr` is kernelspace RAM.
+* 0x40000 is the EDU's internal buffer.
+
+Type note:
+* `__u64`: used in a header shared between kernel and userspace.
+* `u64`: for kernel-only code that's only ever compiled inside the kernel.
+
+### PIO Function Flow
+* Takes size, direction, and `edu_device`, like DMA.
+* Returns 0 on success, non-zero on failure.
+* The for loop increments `i` by 4 each iteration for the 4 bytes.
+* If direction is 1, we're reading FROM the device. Else we're writing TO it.
+* New syntax I picked up: when moving through a buffer by bytes, cast the address to `char *` to force the pointer math to step exactly `i` bytes.
+* Added two new macros to `edu_ioctl.h` for PIO to/from.
+* Made all four commands `_IOWR`. Reason: for DMA timing we need to send the delta back to userspace, which is a read, so it needs both read and write with the kernel. Kept the new PIO ones `_IOWR` too, for the same reason and to be safe.
+
+### The Register Problem: Why 0x04 and Not 0x40000
+* Claude caught that 0x40000 is DMA-only. The CPU cannot address the EDU's internal buffer over MMIO, so PIO can't use it.
+* So I needed another register. 0x04 is an inverter (`~` per the spec). It's the register in the EDU source that is RW and doesn't have a slow operation. Factorial takes real time because it runs an algorithm through the ALU. Inversion is effectively one logic gate, so it's instant.
+* The PIO path performs N/4 bus round trips to the same address, each overwriting the last. We can verify the transaction worked by checking the inverse came back correct.
+* Honest framing of what this measures: the cost of N/4 CPU-supervised MMIO transactions, not a "PIO transfer of N bytes" into a buffer. That's the limitation of this benchmark. What it does do well is force QEMU to execute a legitimate hardware transaction on every iteration, which is exactly the per-word bus cost we want to compare against DMA.
+* `EDU_PIO_TO_DEVICE` (RAM to EDU): PIO writes to a device register, whereas DMA moves bytes into the device's internal buffer. Wrote both cases.
+
+## Userspace Side
+
+* A question kept popping up while writing this: if I'm sending a number to the EDU and reading the inverted value back, why not just use the factorial register? Answer: factorial takes more cycles because it runs a whole algorithm, while inversion takes about one CPU clock cycle. So the inverter is the most viable option for "transmit a number to the device, then have it hand a value straight back," because it adds almost no compute time on top of the bus cost we're actually trying to measure.
+* Same shape as the DMA test: allocate two arrays with `malloc`, fill them with the appropriate numbers, call ioctl, check the values at the end. Keep the arg struct updated in between.
+* One thing DMA didn't need: DMA never talked back to userspace, we didn't need a value returned. Here we do, because we're returning the delta. So in `edu_ioctl` we `copy_to_user` at the end of the PIO switch cases to get the delta across.
+* New syntax for sending it back. We copy from `local_arg` in the kernel to the userspace struct:
+
+```c
+copy_to_user((struct edu_dma_arg __user *)arg, &local_arg, sizeof(local_arg));
+```
+
+This copies from the kernel's `local_arg` to the `edu_dma_arg` struct on the user side, so we're setting the userspace copy too. Since nothing changes except the delta, the `data_ptr` and `size` fields should come back unaffected.
+* Added a reset so the delta resets every time `pio_transfer` starts.
+* Use `%llu` for `u64`.
+
+### Final Sentences to Keep the Confusion Away
+* TO_DEVICE (RAM to EDU): user buffer at `data_ptr` -> `cpu_addr` -> register
+* FROM_DEVICE (EDU to RAM): register -> `cpu_addr` -> `data_ptr`
+
+## First Run and Analysis
+
+Test complete, first run after insmod.
+
+* I don't understand yet why TO device is larger than FROM device. Need to research that.
+* One thing I do know: even though DMA should take almost no time, the QEMU EDU device adds its own hardware propagation delay of about 100ms. Anything past that is the actual DMA time, which looks pretty low. The numbers for both directions are similar and within a small difference, so we're good there.
+* Ran it multiple times. DMA timing is consistent. PIO timing is noisier: sometimes one direction spikes, sometimes the other, but most runs settle around a ~2000ns difference. The spikes come sparsely.
+* This means I need a LOT of readings, automated, to get a final verdict.
+
+## Benchmark Harness Design
+
+* Powers of 2 up to 4096: 4, 8, 16, 32, 64, ... 2048, 4096 (2^2 to 2^12).
+* 5 discarded warmup runs before recording.
+* Record median, max, and min to observe the spread, then move it to Excel to graph.
+* Columns: direction, transfer type, size, samples, then min, max, median. Graph time against size, split by transfer type.
+* Throughput: size / median_time.
+* DMA is consistent with its ~100ms jitter, so it doesn't need many samples for a fair view. 10 samples for DMA. Otherwise 10 samples per 2^n size.
+
 # Syntax Notes
 
 * A new return type I just learned about is `ssize_t`. This returns the amount of bytes that were read successfully.
