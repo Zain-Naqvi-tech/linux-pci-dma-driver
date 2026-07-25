@@ -50,32 +50,37 @@ int main() {
     pio_input[0] = 5; //this is the value which will be read by the inversion register on the edu side of the system
     pio_result[0] = 8; //this is the predetermined value of pio_result for debugging in case everything goes smoothly but the result is not what we expected
 
-    userspace_arg.size = 4; //enough for one word (number 5 and number 8)
-    userspace_arg.data_ptr = (uint64_t)(unsigned long)pio_input;
+    //Loop Starts
 
-    ioctl_result = ioctl(ourFile, EDU_PIO_TO_DEVICE, &userspace_arg);
-    if (ioctl_result) {
-        printf("PIO IOCTL (1) FAILED with error code: %s\n", strerror(errno));
-        return -1;
-    }
+    for (size_t i = 2; i <= 12; i++) { //loop for all sizes - 2^2 (4) to 2^12 (4096)
+        userspace_arg.size = 2^i; //enough for one word (number 5 and number 8)
+        userspace_arg.data_ptr = (uint64_t)(unsigned long)pio_input;
 
-    printf("PIO Time Taken TO device: %llu\n", userspace_arg.delta);
+        ioctl_result = ioctl(ourFile, EDU_PIO_TO_DEVICE, &userspace_arg);
+        if (ioctl_result) {
+            printf("PIO IOCTL (1) FAILED with error code: %s\n", strerror(errno));
+            return -1;
+        }
 
-    userspace_arg.data_ptr = (uint64_t)(unsigned long)pio_result;
+        printf("PIO Time Taken TO device: %llu\n", userspace_arg.delta);
 
-    ioctl_result = ioctl(ourFile, EDU_PIO_FROM_DEVICE, &userspace_arg);
-    if (ioctl_result) {
-        printf("PIO IOCTL (2) FAILED with error code: %s\n", strerror(errno));
-        return -1; 
-    }
+        userspace_arg.data_ptr = (uint64_t)(unsigned long)pio_result;
 
-    printf("PIO Time Taken FROM device: %llu\n", userspace_arg.delta);
+        ioctl_result = ioctl(ourFile, EDU_PIO_FROM_DEVICE, &userspace_arg);
+        if (ioctl_result) {
+            printf("PIO IOCTL (2) FAILED with error code: %s\n", strerror(errno));
+            return -1; 
+        }
 
-    if (pio_result[0] == ~pio_input[0]) {
-        printf("PIO Transfer Successful\n");
-    }
-    else {
-        printf("PIO Transfer Has Failed :(\n");
+        printf("PIO Time Taken FROM device: %llu\n", userspace_arg.delta);
+
+        if (pio_result[0] == ~pio_input[0]) {
+            printf("PIO Transfer Successful\n");
+        }
+        else {
+            printf("PIO Transfer Has Failed :(\n");
+        }
+
     }
 
     free(pio_input);
