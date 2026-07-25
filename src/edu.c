@@ -30,6 +30,7 @@
 #include <linux/fs.h> //used for file operations struct
 #include <linux/dma-mapping.h> //used for DMA operations
 #include "edu_ioctl.h"
+#include <linux/ktime.h> //used for ktime functions
 
 MODULE_LICENSE("GPL"); 
 MODULE_AUTHOR("Zain");
@@ -74,7 +75,7 @@ static struct file_operations fops = {
 };
 
 //DMA Transfer function: Moves memory
-static int dma_transfer(struct edu_device *edudev, size_t size, int direction);
+static int dma_transfer(struct edu_device *edudev, size_t size, int direction, u64 *delta);
 
 //PIO Transfer function: Moves memory using a loop rather than using hardware DMA. 
 static int PIO_transfer(struct edu_device *edudev, size_t size, int direction, u64 *delta);
@@ -97,27 +98,56 @@ static long edu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
     }
 
     switch (cmd) {
-    case EDU_DMA_TO_DEVICE:
+    case EDU_DMA_TO_DEVICE: //RAM to EDU
         
         copy_check = copy_from_user(edudev->cpu_addr, (void __user *)(unsigned long)local_arg.data_ptr, local_arg.size); //copy the data from the user space buffer to the DMA buffer. This is done before the DMA transfer is started so that the data is in the CPU address space and can be accessed by the device
         if (copy_check) { return -EFAULT; } //return an error code to show that there were bytes which could not be successfully copied
-        result = dma_transfer(edudev, local_arg.size, 0); //dma_transfer function to transfer from RAM to the EDU device. Direction=0 to indicate that the direction is from RAM to EDU
-        return result; //return 0 on success or the error code on failure
+        result = dma_transfer(edudev, local_arg.size, 0, &local_arg.delta); //dma_transfer function to transfer from RAM to the EDU device. Direction=0 to indicate that the direction is from RAM to EDU
+        if (result) { return result; }
+
+        //move delta to userspace
+        copy_check = copy_to_user((struct edu_dma_arg __user *)arg, &local_arg, sizeof(local_arg)); //from the kernel side arg to the userspace side arg
+        if (copy_check) { return -EFAULT; }
         
-    case EDU_DMA_FROM_DEVICE:
+        return result;
+
+    case EDU_DMA_FROM_DEVICE: //EDU to RAM
 
         memset(edudev->cpu_addr, 0xFF, DMA_BUFFER_SIZE); //fill the DMA buffer with 0xFF to ensure that the data is being read from the EDU device and not from the CPU address space. This is done before the DMA transfer is started so that the data is in the CPU address space and can be accessed by the device
 
-        result = dma_transfer(edudev, local_arg.size, 1); //transfer from EDU to RAM using the transfer function. Direction is 1 for the opposite direction (EDU to RAM)
+        result = dma_transfer(edudev, local_arg.size, 1, &local_arg.delta); //transfer from EDU to RAM using the transfer function. Direction is 1 for the opposite direction (EDU to RAM)
         if (result) { return result; } //return the error code if the DMA transfer failed (non-zero return)
         copy_check = copy_to_user((void __user *)(unsigned long)local_arg.data_ptr, edudev->cpu_addr, local_arg.size); //copy the data from the DMA buffer to the user space buffer. This is done after the DMA transfer is complete and the data is in the CPU address space
         if (copy_check) { return -EFAULT; } //return an error code to show that there were bytes which could not be successfully copied
+       
+        copy_check = copy_to_user((struct edu_dma_arg __user *)arg, &local_arg, sizeof(local_arg)); //from the kernel side arg to the userspace side arg
+        if (copy_check) { return -EFAULT; }
+
         return result; //return 0 on success or the error code on failure
     
-    case EDU_PIO_TO_DEVICE:
-        copy_check = copy_from_user(edudev->cpu_addr, (void __user *)(unsigned long)local_arg.data_ptr, local_arg.size); //copy the data from the user space buffer to the DMA buffer
+    case EDU_PIO_TO_DEVICE: //RAM to EDU
+        copy_check = copy_from_user(edudev->cpu_addr, (void __user *)(unsigned long)local_arg.data_ptr, local_arg.size); //copy from userspace RAM (data_ptr) to the cpu_addr
+        if (copy_check) { return -EFAULT; } //run a check on copy_from_user()
+        result = PIO_transfer(edudev, local_arg.size, 0, &local_arg.delta); //call PIO_transfer to move data from the RAM to EDU, also passing in the size and delta for timestamps and loops
+        if (result) { return result; }
 
-    case EDU_PIO_FROM_DEVICE:
+        //move the delta to the userspace
+        copy_check = copy_to_user((struct edu_dma_arg __user *)arg, &local_arg, sizeof(local_arg)); //from the kernel side arg to the userspace side arg
+        if (copy_check) { return -EFAULT; }
+
+        return result;
+
+    case EDU_PIO_FROM_DEVICE: //EDU to RAM
+        result = PIO_transfer(edudev, local_arg.size, 1, &local_arg.delta); //this moves the data from the 0x04 register into the cpu_addr
+        if (result) { return result; }
+        copy_check = copy_to_user((void __user *)(unsigned long)local_arg.data_ptr, edudev->cpu_addr, local_arg.size);
+        if (copy_check) { return -EFAULT; }
+
+        //move the delta to the userspace
+        copy_check = copy_to_user((struct edu_dma_arg __user *)arg, &local_arg, sizeof(local_arg)); //from the kernel side arg to the userspace side arg
+        if (copy_check) { return -EFAULT; }
+        
+        return result; 
 
     default:
         return -ENOTTY; //return an error code that indicates that the command is not supported by the driver
@@ -134,13 +164,19 @@ static int PIO_transfer(struct edu_device *edudev, size_t size, int direction, u
     u64 start;
     u64 end; 
 
+    *delta = 0; //reset everytime PIO_transfer is called
+
+    if (size % 4 != 0) { //this helps us deal with unmatched sizes like 7 or 10 bytes. Only 4's multiple bytes will work this way
+        return -EINVAL;
+    }
+
     //start timer
     start = ktime_get_ns(); //starting time
 
-    for (int i = 0; i < size; i+=4) {
+    for (size_t i = 0; i < size; i+=4) {
         if (direction) { //EDU to RAM. 0x04 to cpu_addr
             read_result = ioread32(edudev->io_base + PIO_TEST_REGISTER); //read the result from 0x04
-            *(u32 *)((char*)edudev->cpu_addr + i) = read_result; //this dereferences the address location and stotes the read_result from 0x40000
+            *(u32 *)((char*)edudev->cpu_addr + i) = read_result; //this dereferences the address location and stotes the read_result from 0x04
         }
         else { //RAM to EDU. cpu_addr to 0x04
             read_result = *(u32 *)((char*)edudev->cpu_addr + i); //read the result from dereferencing cpu_addr + i
@@ -177,14 +213,21 @@ static irqreturn_t irq_handler(int irq, void *dev_id) {
     return IRQ_HANDLED; 
 }
 
-static int dma_transfer(struct edu_device *edudev, size_t size, int direction) {
+static int dma_transfer(struct edu_device *edudev, size_t size, int direction, u64 *delta) {
 
     int dma_command_register = 0;
     int completion_result;
 
+    u64 startTime; 
+    u64 endTime; 
+
+    *delta = 0;
+
     if (size > DMA_BUFFER_SIZE) { //check if the size of the transfer is greater than the size of the allocated DMA buffer
         return -EINVAL; //return an error code that indicates that the argument is invalid
     }
+
+    startTime = ktime_get_ns(); //starting time
 
     if (direction) { //EDU to RAM - Reading from the device
         reinit_completion(&edudev->dma_work_done); //reinitialize the completion struct to reset the 'done' field to 0 and the waiting queue to empty
@@ -194,6 +237,10 @@ static int dma_transfer(struct edu_device *edudev, size_t size, int direction) {
         dma_command_register = (0x01 | 0x02 | 0x04); //start transfer, EDU to RAM (direction is 1), raise interrupt after finishing
         iowrite32(dma_command_register, edudev->io_base + DMA_COMMAND_REGISTER);
         completion_result = wait_for_completion_interruptible(&edudev->dma_work_done); //wait for the DMA transfer to complete
+        
+        endTime = ktime_get_ns(); //end time
+        *delta = (endTime - startTime); //find and fill out delta value
+
         if (completion_result) { 
             return -ERESTARTSYS; //return an error code that indicates that the operation should be restarted
         }
@@ -210,6 +257,10 @@ static int dma_transfer(struct edu_device *edudev, size_t size, int direction) {
         dma_command_register = (0x01 | 0x00 | 0x04); //Start transfer, RAM to edu (direction is 0), raise interrupt after finishing 
         iowrite32(dma_command_register, edudev->io_base + DMA_COMMAND_REGISTER); //write the command to the command register to start the transfer
         completion_result = wait_for_completion_interruptible(&edudev->dma_work_done); //wait for the DMA transfer to complete. This puts the thread to sleep until the ISR wakes it up
+        
+        endTime = ktime_get_ns(); //end time
+        *delta = (endTime - startTime); //find and fill out delta value
+       
         if (completion_result) { 
             return -ERESTARTSYS; //return an error code that indicates that the operation should be restarted
         }
