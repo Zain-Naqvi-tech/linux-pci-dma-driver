@@ -858,6 +858,159 @@ Test complete, first run after insmod.
 * Throughput: size / median_time.
 * DMA is consistent with its ~100ms jitter, so it doesn't need many samples for a fair view. 10 samples for DMA. Otherwise 10 samples per 2^n size.
 
+---
+
+# CSV Output and Benchmark Harness
+
+## Learning CSV in C
+
+* A CSV file is just plain text. Each line is one row, fields on a line are separated by commas, and the line ends with `\n`.
+* Open a file with `fopen`, print into it with `fprintf`, and remember to `fclose` at the end.
+* `fprintf` is like `printf`, it just takes the file as the first parameter.
+* Remember to open the file in write mode.
+
+Side note I picked up: to reverse a git commit and push, `git reset HEAD~1` then `git push --force origin main`.
+
+## The Loops
+
+* **DMA:** 11 total runs per size, 1 warmup plus 10 recorded. 11 sizes.
+* **PIO:** 30 total runs per size, 5 warmups plus 25 recorded. 11 sizes.
+
+## Buffer Initialization Gotcha
+
+I learned we need to fill out every index of the memory region so the kernel doesn't push leftover malloc garbage to the hardware for any size larger than the one we first set. This came up specifically for PIO: I had only set one index of the array with an integer and set the size to 4. But every +4 increase in size means another element gets transferred, so I have to initialize the whole buffer up front, not just the first slot.
+
+## Powers of 2 With Bit Shifting
+
+We can compute 2^n with a bit shift, so I scrapped the `pow()` call. `1 << n` gives the size directly.
+
+## Finding Min, Max, and Median
+
+Target table shape:
+
+| Size | Type | Direction | Median | Min | Max | Samples |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 4 | PIO | TO | - | - | - | 30 |
+| 4 | PIO | FROM | - | - | - | 30 |
+| 8 | PIO | TO | - | - | - | 30 |
+| 8 | PIO | FROM | - | - | - | 30 |
+
+I first found min and max the manual way, looping and tracking the running extremes. Then I realized that to get the median I'd use `qsort` anyway, and a sorted array hands me min and max for free (first and last elements). So I switched to sorting.
+
+### qsort and the Comparator
+
+`qsort` is simple, but it needs a comparator function to work:
+* You pass the function name as the last argument to `qsort()`.
+* The comparator returns an int based on comparing two elements: zero if equal, negative if the first is smaller, positive if the first is bigger.
+* We're comparing `uint64_t` values.
+* The comparator takes a `const void *` for both a and b.
+* Cast each to `uint64_t`, then compare using the rules above and return the appropriate value.
+* Note: with these rules the sort is ascending. If val_A is bigger than val_B, we return positive, which moves the bigger number toward the end.
+
+### findMedian Function
+
+I wrote a `findMedian` function because I have both even and odd sized arrays, and handling both inline was getting messy. Abstraction earns its place here.
+
+I first tried to return the INDEX of the median, but for the even case I need the average of the middle two values, so I switched to returning the actual value instead.
+
+For the even case, n/2 gives the upper of the two middle indices. Example with n = 30: 30/2 = 15, so index 15 and the index before it (14) are the two middle values. Average them and return.
+
+I return the rounded-down integer average as `uint64_t` so it matches the time data type (the delta is `__u64`).
+
+It works. First run tables below for reference before moving to Excel.
+
+### First Run: PIO (ns)
+
+| Size | Dir | Median | Min | Max | N |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 4 | TO | 1,520 | 990 | 314,940 | 25 |
+| 4 | FROM | 1,610 | 910 | 90,450 | 25 |
+| 8 | TO | 9,480 | 1,430 | 3,464,310 | 25 |
+| 8 | FROM | 9,570 | 1,390 | 5,096,640 | 25 |
+| 16 | TO | 2,620 | 2,080 | 1,591,570 | 25 |
+| 16 | FROM | 3,770 | 2,210 | 6,816,830 | 25 |
+| 32 | TO | 21,490 | 5,750 | 3,742,750 | 25 |
+| 32 | FROM | 33,440 | 7,270 | 3,806,270 | 25 |
+| 64 | TO | 118,620 | 12,660 | 3,484,450 | 25 |
+| 64 | FROM | 14,670 | 9,150 | 6,611,770 | 25 |
+| 128 | TO | 45,310 | 10,120 | 4,701,000 | 25 |
+| 128 | FROM | 129,800 | 10,750 | 5,778,960 | 25 |
+| 256 | TO | 31,560 | 16,920 | 3,000,600 | 25 |
+| 256 | FROM | 27,200 | 18,550 | 15,079,550 | 25 |
+| 512 | TO | 759,000 | 34,550 | 4,471,150 | 25 |
+| 512 | FROM | 89,420 | 39,710 | 3,109,660 | 25 |
+| 1024 | TO | 1,370,300 | 75,780 | 3,152,340 | 25 |
+| 1024 | FROM | 243,940 | 73,730 | 2,638,610 | 25 |
+| 2048 | TO | 520,460 | 132,900 | 4,399,370 | 25 |
+| 2048 | FROM | 1,441,700 | 162,190 | 5,077,210 | 25 |
+| 4096 | TO | 2,225,100 | 258,840 | 4,372,810 | 25 |
+| 4096 | FROM | 1,586,200 | 306,330 | 3,389,950 | 25 |
+
+### First Run: DMA (ns)
+
+| Size | Dir | Median | Min | Max | N |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 4 | TO | 100,131,550 | 99,506,480 | 100,636,780 | 10 |
+| 4 | FROM | 99,819,515 | 99,568,610 | 100,814,680 | 10 |
+| 8 | TO | 99,856,135 | 99,497,330 | 100,789,220 | 10 |
+| 8 | FROM | 99,985,045 | 99,452,340 | 100,851,300 | 10 |
+| 16 | TO | 100,307,445 | 99,676,150 | 101,094,200 | 10 |
+| 16 | FROM | 100,500,745 | 99,711,690 | 100,972,030 | 10 |
+| 32 | TO | 100,268,560 | 99,686,180 | 101,755,770 | 10 |
+| 32 | FROM | 100,301,255 | 99,609,610 | 100,686,530 | 10 |
+| 64 | TO | 100,316,500 | 99,579,330 | 100,580,910 | 10 |
+| 64 | FROM | 100,025,865 | 99,622,570 | 100,941,150 | 10 |
+| 128 | TO | 100,470,455 | 99,816,160 | 101,241,100 | 10 |
+| 128 | FROM | 100,343,420 | 99,677,530 | 101,058,450 | 10 |
+| 256 | TO | 99,970,385 | 99,665,390 | 100,627,000 | 10 |
+| 256 | FROM | 99,773,045 | 99,426,710 | 100,476,830 | 10 |
+| 512 | TO | 100,600,175 | 99,712,050 | 101,098,570 | 10 |
+| 512 | FROM | 100,251,850 | 99,727,890 | 100,817,670 | 10 |
+| 1024 | TO | 100,645,920 | 100,219,910 | 101,063,930 | 10 |
+| 1024 | FROM | 100,193,475 | 99,835,080 | 100,569,090 | 10 |
+| 2048 | TO | 100,041,830 | 99,696,270 | 101,642,510 | 10 |
+| 2048 | FROM | 100,471,045 | 99,767,350 | 100,802,000 | 10 |
+| 4096 | TO | 100,281,560 | 99,566,770 | 100,937,060 | 10 |
+| 4096 | FROM | 100,379,515 | 99,421,180 | 100,978,370 | 10 |
+
+## Excel: Why Min Instead of Median
+
+We plot the MIN time, not the median. I started with median, but the median jumps around unreasonably at points. For example, at size 128 direction TO, the median comes out faster than size 64 direction TO, which makes no physical sense. The min time is a better representation of the true underlying transfer cost. It is the least contaminated run, the one with the fewest scheduler interruptions and cache misses piled on top.
+
+One thing to be clear about, since it's a real choice and not an accident: median answers "what does a user typically experience," min answers "what is the operation fundamentally capable of." I care about the second question here, so min is the right estimator. That is a deliberate pick, not a default.
+
+## The 100ms DMA Delay, Confirmed Against the Source
+
+The ~100ms sitting in every DMA row is not measurement noise and it is not my wait path. It is hardcoded in the EDU device model. From `hw/misc/edu.c`, the DMA path arms its completion timer like this:
+
+```c
+timer_mod(&edu->dma_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+```
+
+The unit is right there in the function name: `qemu_clock_get_ms` returns virtual time in milliseconds, and the code adds 100. So the DMA-complete interrupt is scheduled a flat 100ms after the transfer is kicked off. That is why the entire DMA table sits at ~100,000,000 ns regardless of size or direction.
+
+Two things this line settles:
+* **It is virtual time, not wall-clock.** `QEMU_CLOCK_VIRTUAL` is the guest's model time, so the delay is a property of the device model, not of my host being slow or TCG wakeup latency. My userspace 100ms and the device's 100ms agree because the device is the source of both.
+* **The delay has no size term.** The transfer count register never touches this timer. The delay is a bare `+ 100`, identical for 4 bytes and 4096 bytes. This is the source-level reason the DMA line in the graph is flat.
+
+Why would the model author pick such a huge, unrealistic number? It is a deliberate teaching exaggeration. A real DMA of a few KB completes in well under a microsecond, which a student would never see. Blowing the completion out to 100ms makes the "kick off, sleep, get woken by the completion interrupt" cycle observable and debuggable. It is not meant to be a realistic transfer time, and I should not present it as one.
+
+## PIO vs DMA: The Graph
+
+[IMAGE PLACEHOLDER: PIO vs DMA log-log plot, log min time (ns) against log size (bytes)]
+
+Here is the graph. DMA stays flat at roughly the 100ms mark across every size, while PIO time climbs steadily as size grows.
+
+On the face of it, DMA looks slower than PIO across our whole range. But that is entirely the hardcoded 100ms completion delay dominating the number and hiding the real transfer cost, which we now know from the source is a fixed model constant. The real thing the DMA line proves is that DMA cost is independent of transfer size: the line is flat because the model's delay has no size term.
+
+The PIO line is on a trajectory to meet the DMA line at some size beyond our 4KB device buffer limit. Past that crossover, DMA would stay faster because it does not grow with size, while PIO keeps climbing. I want to be honest that this is a projection from the two slopes, not something I could measure, since the device buffer caps at 4096 and the PIO path can't scale past it. So it is "where the lines would cross if the trends held," not a measured crossover.
+
+Why, in theory:
+* DMA uses dedicated hardware to move data directly between the device and system memory. The CPU is mostly free after setup.
+* PIO uses the CPU as a middleman for every word, so more CPU-supervised bus cycles as size grows.
+
+So the DMA true transfer cost is invisible in our graph because the fixed 100ms delay dominates. What the graph does prove is that DMA is independent of size, while PIO scales with it. Because of that fixed overhead, DMA loses on small transfers and wins on large ones. It is the classic fixed setup cost versus per-byte cost tradeoff.
+
 # Syntax Notes
 
 * A new return type I just learned about is `ssize_t`. This returns the amount of bytes that were read successfully.
