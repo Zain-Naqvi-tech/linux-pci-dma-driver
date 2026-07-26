@@ -226,3 +226,109 @@ factorial `read`/`write` path is unaffected.
 
 A programmed I/O path and a latency and throughput benchmark comparing PIO,
 interrupt-driven, and DMA transfers across a range of sizes.
+
+## PIO vs DMA Benchmark
+
+Three transfer paths are benchmarked between host memory and the EDU device
+across sizes from 4 bytes to 4096 bytes (powers of 2, `2^2` to `2^12`):
+
+- **PIO:** CPU-supervised, one 32-bit word per bus transaction.
+- **DMA:** the device moves the data itself, the CPU only does setup.
+
+Interrupt latency versus polling is measured separately, in the next section.
+
+An honest note on what the PIO path actually measures. The EDU's 4 KB internal
+buffer at `0x40000` is DMA-only and is not reachable by the CPU over MMIO, so
+PIO cannot transfer into that buffer. Instead the PIO path performs `N/4` bus
+round trips to register `0x04` (the inverter), each one a real hardware
+transaction that is verified by checking the inverted value came back correct.
+The inverter is used rather than the factorial register because inversion is
+effectively one logic gate and adds almost no compute time on top of the bus
+cost being measured, whereas the factorial runs a real algorithm through the
+ALU. This measures the per-word, CPU-supervised bus cost, which is exactly what
+belongs up against DMA, but it is not a "PIO transfer of `N` bytes into a
+buffer." Being upfront about that limitation.
+
+### Userspace harness design
+
+The benchmark runs entirely in userspace and drives the device through the
+`ioctl` interface. The shape is two nested loops:
+
+- The **outer loop** walks the sizes, `2^2` to `2^12`.
+- The **inner loop** runs each transfer `N` times per size (30 for PIO, 11 for
+  DMA), for both the TO and FROM directions.
+
+Warmup discards come first. The opening runs hit cold caches and an unwarmed
+pipeline, so they execute but are not recorded: 5 discarded for PIO (leaving 25
+samples), 1 for DMA (leaving 10). The recorded deltas are packed densely into a
+per-direction array using a separate sample counter as the write index, so
+there are no uninitialised gaps, and that same counter doubles as the true
+sample count for the CSV. TO and FROM each get their own array and their own
+counter, since two independent directions cannot share one write position.
+
+Once an array is full, all three statistics are found from a single sort:
+
+- `qsort` the array.
+- **min** is the first element and **max** is the last, both free once sorted.
+- **median** is the middle element, or the average of the two middle elements
+  for an even count.
+
+Every `(size, direction)` pair becomes one CSV row written with `fprintf`,
+giving 22 PIO rows and 22 DMA rows in the format
+`size, type, direction, median_ns, min_ns, max_ns, samples`. That file opens
+straight into Excel for graphing.
+
+### Why min, not median
+
+The noise is strictly moving the times UP. The host can steal CPU time but can never give it back, so a
+contaminated sample is always slower than a clean one, never faster. The min is
+therefore the least-contaminated run and the best estimate of the true transfer
+cost. The median got dragged upward and even had a larger
+transfer sometimes reporting a smaller median precisely because more than half
+the samples were noisy. So the graph plots the min.
+
+### Running it
+
+```bash
+# Build and load the driver in the guest
+cd /mnt/host/src && make && sudo insmod edu.ko
+sudo dmesg | tail        # confirm the allocations
+
+# Build and run the benchmark harness
+cd /mnt/host/userspace && gcc -Wall -Wextra -o edu_bench edu_bench.c
+sudo ./edu_bench         # writes csv_result_file
+sudo dmesg | tail -20
+```
+
+The harness writes `csv_result_file` in the working directory. Rename it to
+`.csv` and open it in Excel to graph min time against size on log-log axes.
+
+### Results
+
+![Chart showing the DMA vs PIO Comparison](image-2.png)
+
+The graph shows DMA staying flat around the 100 ms mark while PIO time climbs
+with size. DMA looks slower than PIO here, but the EDU device in QEMU adds a
+fixed delay of about 100 ms to every DMA transfer, visible in the data as a
+floor near `100,000,000 ns` that does not move with size. Because that delay is
+artificial and known, what the data proves is that DMA is consistent and
+size-independent. Its true transfer cost is invisible here because the fixed
+delay dominates by orders of magnitude, so the flatness of the line, not the
+raw number, is the real observation.
+
+The PIO line is destined to collide with the DMA line at some size
+beyond the 4 KB buffer cap. A linearly rising line and a flat line must cross.
+Past that crossover, DMA stays flat while PIO keeps climbing, so DMA wins from
+there onward. The crossover cannot be reached on this device, since the buffer
+caps transfers at 4 KB, so this is inferred from the shape of the two curves
+rather than observed directly.
+
+Why this happens, in theory:
+
+- DMA uses dedicated hardware to move data directly between the device and
+  system memory. The CPU is mostly free except for setup.
+- PIO uses the CPU as a middleman for every word (4 bytes per iteration via
+  `ioread32` / `iowrite32`). The bus cycles scale linearly with size.
+
+Because of that fixed setup overhead, DMA loses on small transfers and wins on
+large ones. It comes down to fixed setup cost versus per-byte cost.
