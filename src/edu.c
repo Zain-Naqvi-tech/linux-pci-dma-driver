@@ -448,6 +448,7 @@ static void remove(struct pci_dev* pcidev){
     pci_free_irq_vectors(pcidev);
     iounmap(edudev->io_base); //unmap the BAR0 region from virtual Kernel Space
     pci_release_region(pcidev, 0); //release the claimed BAR0 region
+    pci_clear_master(pcidev);
     pci_disable_device(pcidev);
     pr_info("Removed Device Successfully\n");
 }

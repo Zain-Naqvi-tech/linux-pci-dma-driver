@@ -222,20 +222,25 @@ Confirmed working: 20-byte round trip returns the original pattern, an
 oversized request returns `EINVAL` without touching the buffer, and the
 factorial `read`/`write` path is unaffected.
 
-### In progress
+### Next
 
-A programmed I/O path and a latency and throughput benchmark comparing PIO,
-interrupt-driven, and DMA transfers across a range of sizes.
+A programmed I/O path and a benchmark comparing it against DMA across a range
+of transfer sizes.
 
 ## PIO vs DMA Benchmark
 
-Three transfer paths are benchmarked between host memory and the EDU device
+Two transfer paths are benchmarked between host memory and the EDU device
 across sizes from 4 bytes to 4096 bytes (powers of 2, `2^2` to `2^12`):
 
 - **PIO:** CPU-supervised, one 32-bit word per bus transaction.
 - **DMA:** the device moves the data itself, the CPU only does setup.
 
-Interrupt latency versus polling is measured separately, in the next section.
+Interrupt-driven I/O is not a third line on the graph, but it is not absent
+either. The DMA measurement is an interrupt-driven measurement: the driver
+programs the command register, sleeps on a `struct completion`, and is woken by
+the MSI the device raises when the transfer finishes. Every DMA number in the
+table is the cost of that full round trip. See the scope note near the end of
+this file for why interrupt latency is not isolated as its own figure.
 
 An honest note on what the PIO path actually measures. The EDU's 4 KB internal
 buffer at `0x40000` is DMA-only and is not reachable by the CPU over MMIO, so
@@ -332,3 +337,103 @@ Why this happens, in theory:
 
 Because of that fixed setup overhead, DMA loses on small transfers and wins on
 large ones. It comes down to fixed setup cost versus per-byte cost.
+
+## Interrupt Latency Benchmark (Scoped Out)
+ 
+The original plan had a third line on the benchmark graph: isolated interrupt
+latency, measured from the write that raises the interrupt to the first
+instruction in the ISR. It is not in the final project, and that was a decision.
+ 
+Two reasons.
+ 
+The first is that the comparison it was meant to make was already made, earlier
+and more directly. Phase 2 read the factorial result by spinning on bit 0 of the
+status register with `cpu_relax()`, holding a core the entire time the device was
+working. Phase 3 replaced that with `wait_for_completion_interruptible` and an
+MSI handler, and the reader gave the CPU back. That change is visible in
+`/proc/interrupts` and in the structure of the read path itself. A number would
+not have told me anything the rewrite did not.
+ 
+The second is that the number would have been mostly about QEMU. This device
+runs emulated, so the gap between the raise register write and the first line of
+the ISR is dominated by the emulator's interrupt delivery path, not by anything
+in the driver. Reporting it as an interrupt latency figure would have implied a
+property of the design that the measurement does not actually support. The DMA
+timing already contains a real interrupt round trip, which is the honest version
+of the same observation.
+ 
+If this driver ever ran against silicon, isolating that latency would be worth
+doing, and the hooks for it are straightforward: a timestamp stored to the
+per-device struct before `complete()` is called, so the store is ordered by the
+completion's own lock, and the delta handed back through the existing ioctl
+argument struct.
+ 
+ 
+## Repository Layout
+ 
+```
+src/
+  edu.c            the driver
+  edu_ioctl.h      shared ABI header, compiled by both sides
+  Makefile         out-of-tree Kbuild
+userspace/
+  edu_test.c       functional test: factorial path, DMA round trip
+  edu_test.c       benchmark harness, writes the CSV
+ENGINEERING_NOTES.md   the working log, kept as I went
+```
+ 
+Note that `userspace/` holds test applications, not a library. They call the
+ioctl interface directly. Wrapping that interface in a proper shared library
+with a clean C API is the obvious next piece of work and is not done.
+ 
+ 
+## Project Status
+ 
+Complete and working. The driver binds to the EDU device, exposes `/dev/edu`,
+computes factorials through an MSI interrupt-driven read path, moves 4 KB in
+either direction over coherent DMA through an ioctl interface, and runs a
+PIO path against a device register for comparison. The benchmark harness
+produces a CSV across 11 transfer sizes in both directions.
+ 
+What is deliberately not here:
+ 
+- A userspace library and a Python wrapper over it.
+- An isolated interrupt latency figure, for the reasons above.
+- Streaming DMA. This driver uses coherent mapping only.
+- Any concurrency beyond a single reader. See the limitations below.
+
+## Limitations and What I Would Do Differently
+ 
+Being upfront about the parts that would not survive contact with a real system.
+ 
+**The PIO path measures bus transactions, not a buffer transfer.** The EDU's 4 KB
+internal buffer at `0x40000` is reachable only by the DMA engine, so PIO cannot
+target it. The PIO path instead performs `N/4` round trips to the inverter
+register at `0x04`, each one overwriting the last. That is a real per-word
+CPU-supervised bus cost, which is the thing worth comparing against DMA, but it
+is not the same shape of operation as the DMA transfer sitting next to it on
+the graph.
+ 
+**No locking on the read path.** `readFlag` is written by `write()` and read and
+cleared by `read()` with nothing protecting the sequence. With one process using
+the device this is fine, and it is what I tested. Two concurrent readers would
+race on the flag and on the completion. A mutex around the file operations would
+fix it, and a mutex is legal here because the file operations run in process
+context. It could not be shared with the ISR, which cannot sleep.
+ 
+**The ioctl copies the whole argument struct back to userspace.** Only `delta`
+changes in the kernel, but the copy-back writes all three fields. That is
+harmless as written, since `size` and `data_ptr` go back unchanged. It is worth
+knowing that it means the kernel would overwrite any change userspace made to
+that struct between the inbound copy and the outbound one. Copying back only the
+`delta` field would be tighter.
+
+## Sources
+
+- QEMU EDU device specification: https://www.qemu.org/docs/master/specs/edu.html
+- QEMU device model source, `hw/misc/edu.c`, for the DMA completion timer
+- Linux PCI driver documentation: https://docs.kernel.org/PCI/pci.html
+- MSI HOWTO: https://docs.kernel.org/PCI/msi-howto.html
+- ioctl documentation: https://docs.kernel.org/driver-api/ioctl.html
+- Linux Device Drivers, 3rd Edition, for the char device and DMA chapters,
+  cross-checked against current API signatures
